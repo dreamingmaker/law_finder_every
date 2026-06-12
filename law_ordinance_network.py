@@ -99,27 +99,47 @@ OPENAI_URL = "https://api.openai.com/v1/chat/completions"
 OPENAI_MODEL = "gpt-4o-mini"
 
 
-def generate_amendment(api_key, ordinance_name, gov, old_name, new_name, cited_articles, model=OPENAI_MODEL):
+def generate_amendment(api_key, ordinance_name, gov, old_name, new_name, cited_articles,
+                       law_articles=None, model=OPENAI_MODEL):
     """옛 법령명을 인용하는 조문(cited_articles)을 OpenAI로 분석해 신구대조표(개정안)를 생성.
-    「공무원을 위한 AI 활용」 7-5장 CoVe 원칙: 원문에 있는 것만·명칭치환만·환각금지."""
+    law_articles(현행법 조문 번호·제목·이동이력)가 있으면, 조례가 인용한 '제N조'가
+    현행법에 유효한지(삭제·이동됐는지)까지 점검한다 — 7-5-4 '끊어진 참조 찾기'.
+    원칙: 원문에 있는 것만·명칭치환만·목록에 없는 조문번호 환각금지."""
     blocks = "\n\n".join(f"[{(t or '조문')}] {c}" for t, c in cited_articles)
+    law_list = ""
+    if law_articles:
+        rows = []
+        for a in law_articles:
+            tag = ""
+            if a.get("moved_from"):
+                tag = f"  (←옛 제{a['moved_from']}조에서 이동)"
+            elif a.get("changed") == "Y":
+                tag = "  (개정됨)"
+            rows.append(f"제{a['no']}조 {a.get('title', '')}{tag}")
+        law_list = "\n".join(rows)
     system = (
         "당신은 한국 지방자치단체의 자치법규(조례·규칙) 정비 전문가다. "
-        "조례 본문에서 '옛 법령명'을 '현행 법령명'으로 바꾸는 개정안을 신구대조표로 만든다.\n"
+        "조례 본문의 '옛 법령명'을 '현행 법령명'으로 바꾸는 개정안을 신구대조표로 만든다.\n"
         "반드시 지킬 원칙:\n"
         "1) 제시된 원문에 옛 법령명이 실제로 들어 있는 조문만 대상으로 한다. 없는 조문·문장을 지어내지 마라.\n"
-        "2) 법령명 '명칭 치환'만 한다. 그 외 내용·조문번호·구조·금액·날짜는 절대 바꾸지 마라.\n"
-        "3) 낫표(「」)·조사·조문번호 표기는 원문 그대로 보존한다.\n"
-        "4) 확실하지 않으면 '추가 확인 필요'로 표시한다.\n\n"
+        "2) 법령명 '명칭 치환'을 한다. 그 외 내용·금액·날짜는 절대 바꾸지 마라.\n"
+        "3) 낫표(「」)·조사 표기는 원문 그대로 보존한다.\n"
+        "4) [조문 참조 점검] 조례가 인용한 '제N조'가 아래 '현행 법령 조문 목록'에 있는지 확인한다. "
+        "번호가 목록에 없거나 제목이 전혀 다르면, 목록 중 내용상 대응하는 조문 번호를 제시하되 반드시 '(추정)'을 붙인다. "
+        "목록만으로 판단이 안 되면 '현행 확인 필요'라고 적는다. 목록에 없는 조문 번호를 지어내지 마라.\n\n"
         "출력 형식(이외 군더더기 금지):\n"
-        "| 조문 | 현행 | 개정안 | 사유 |\n"
-        "각 행은 옛 법령명이 나온 조문 1개씩 작성. 표 다음 줄에 '정비 요약: ...' 한 줄."
+        "| 조례 조문 | 현행(조례 인용) | 개정안 | 조문 참조 점검 | 사유 |\n"
+        "각 행은 옛 법령명이 나온 조례 조문 1개씩. '조문 참조 점검' 칸에는 "
+        "'제N조 유효' / '제N조→제M조(추정)' / '현행 확인 필요' 중 하나를 적는다.\n"
+        "표 다음 줄에 '정비 요약: ...' 한 줄."
     )
     user = (
         f"조례명: {ordinance_name} ({gov})\n"
         f"명칭 변경: 「{old_name}」  →  「{new_name}」\n\n"
-        f"[옛 법령명이 인용된 조문 원문]\n{blocks}\n\n"
-        f"위 조문에서 「{old_name}」을 「{new_name}」으로 바꾸는 신구대조표를 만들어줘."
+        f"[옛 법령명이 인용된 조례 조문 원문]\n{blocks}\n\n"
+        + (f"[현행 「{new_name}」 조문 목록(번호·제목)]\n{law_list}\n\n" if law_list else "")
+        + f"위 조례 조문에서 「{old_name}」을 「{new_name}」으로 바꾸고, "
+          f"인용한 '제N조'가 현행법에 유효한지(삭제·이동)까지 점검한 신구대조표를 만들어줘."
     )
     payload = {"model": model, "temperature": 0.1,
                "messages": [{"role": "system", "content": system},
@@ -127,7 +147,7 @@ def generate_amendment(api_key, ordinance_name, gov, old_name, new_name, cited_a
     resp = requests.post(
         OPENAI_URL,
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json=payload, timeout=90)
+        json=payload, timeout=120)
     if resp.status_code != 200:
         raise RuntimeError(f"OpenAI API 오류 {resp.status_code}: {resp.text[:300]}")
     return resp.json()["choices"][0]["message"]["content"].strip()
@@ -291,6 +311,24 @@ class LawGoKrAPI:
             "ministry": _ftext(src, "소관부처", "소관부처명"),
             "law_id": _ftext(src, "법령ID"),
         }
+
+    # 법령 조문 목록 (번호·제목·이동이력) — 끊어진 참조(7-5-4) 추적용 --------
+    def get_law_articles(self, mst):
+        """현행 법령의 조문 목록을 돌려준다: [{no,title,moved_from,moved_to,changed,content}]."""
+        root = self._get_xml("lawService.do", {"target": "law", "MST": mst})
+        arts = []
+        for jo in root.iter("조문단위"):
+            if (_ftext(jo, "조문여부") or "") != "조문":
+                continue  # 장·절 제목(전문) 행 제외
+            arts.append({
+                "no": _ftext(jo, "조문번호"),
+                "title": _ftext(jo, "조문제목"),
+                "moved_from": _ftext(jo, "조문이동이전"),
+                "moved_to": _ftext(jo, "조문이동이후"),
+                "changed": _ftext(jo, "조문변경여부"),
+                "content": _ftext(jo, "조문내용"),
+            })
+        return arts
 
     # 자치법규(조례·규칙) 검색 -------------------------------------------
     def search_ordinance(self, query, org=None, search=2, display=100, page=1):
@@ -1009,7 +1047,16 @@ class App(tk.Tk):
                                       self.btn_amend.config(state="normal"),
                                       messagebox.showinfo("개정안", "본문에서 옛 명칭을 찾지 못했습니다.")))
                     return
-                result = generate_amendment(DEFAULT_OPENAI, it["name"], it["gov"], old_name, new_name, hit)
+                # 현행법 조문 목록 조회 → '인용한 제N조'가 유효한지(끊어진 참조) 점검에 사용
+                law_arts = None
+                try:
+                    mst_law = (self.law_info or {}).get("mst")
+                    if mst_law:
+                        law_arts = self.api.get_law_articles(mst_law)
+                except Exception:
+                    law_arts = None
+                result = generate_amendment(DEFAULT_OPENAI, it["name"], it["gov"],
+                                            old_name, new_name, hit, law_articles=law_arts)
                 self._ui(lambda: self._show_amendment(it, old_name, new_name, result))
             except Exception as e:
                 msg = str(e)
