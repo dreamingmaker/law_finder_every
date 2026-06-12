@@ -94,6 +94,43 @@ def _load_dotenv():
 
 _load_dotenv()
 DEFAULT_OC = os.environ.get("LAW_OC", "")   # .env 또는 시스템 환경변수에서 (없으면 빈 값)
+DEFAULT_OPENAI = os.environ.get("OPENAI_API_KEY", "")  # 조례 개정안 생성용(선택)
+OPENAI_URL = "https://api.openai.com/v1/chat/completions"
+OPENAI_MODEL = "gpt-4o-mini"
+
+
+def generate_amendment(api_key, ordinance_name, gov, old_name, new_name, cited_articles, model=OPENAI_MODEL):
+    """옛 법령명을 인용하는 조문(cited_articles)을 OpenAI로 분석해 신구대조표(개정안)를 생성.
+    「공무원을 위한 AI 활용」 7-5장 CoVe 원칙: 원문에 있는 것만·명칭치환만·환각금지."""
+    blocks = "\n\n".join(f"[{(t or '조문')}] {c}" for t, c in cited_articles)
+    system = (
+        "당신은 한국 지방자치단체의 자치법규(조례·규칙) 정비 전문가다. "
+        "조례 본문에서 '옛 법령명'을 '현행 법령명'으로 바꾸는 개정안을 신구대조표로 만든다.\n"
+        "반드시 지킬 원칙:\n"
+        "1) 제시된 원문에 옛 법령명이 실제로 들어 있는 조문만 대상으로 한다. 없는 조문·문장을 지어내지 마라.\n"
+        "2) 법령명 '명칭 치환'만 한다. 그 외 내용·조문번호·구조·금액·날짜는 절대 바꾸지 마라.\n"
+        "3) 낫표(「」)·조사·조문번호 표기는 원문 그대로 보존한다.\n"
+        "4) 확실하지 않으면 '추가 확인 필요'로 표시한다.\n\n"
+        "출력 형식(이외 군더더기 금지):\n"
+        "| 조문 | 현행 | 개정안 | 사유 |\n"
+        "각 행은 옛 법령명이 나온 조문 1개씩 작성. 표 다음 줄에 '정비 요약: ...' 한 줄."
+    )
+    user = (
+        f"조례명: {ordinance_name} ({gov})\n"
+        f"명칭 변경: 「{old_name}」  →  「{new_name}」\n\n"
+        f"[옛 법령명이 인용된 조문 원문]\n{blocks}\n\n"
+        f"위 조문에서 「{old_name}」을 「{new_name}」으로 바꾸는 신구대조표를 만들어줘."
+    )
+    payload = {"model": model, "temperature": 0.1,
+               "messages": [{"role": "system", "content": system},
+                            {"role": "user", "content": user}]}
+    resp = requests.post(
+        OPENAI_URL,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json=payload, timeout=90)
+    if resp.status_code != 200:
+        raise RuntimeError(f"OpenAI API 오류 {resp.status_code}: {resp.text[:300]}")
+    return resp.json()["choices"][0]["message"]["content"].strip()
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -427,7 +464,7 @@ class App(tk.Tk):
 
         # row 0 — 법률명(+법령 확인) / 지자체(광역·시군구 콤보)
         ttk.Label(top, text="법률명").grid(row=0, column=0, padx=(10, 4), pady=(10, 4), sticky="e")
-        self.var_law = tk.StringVar(value="주차장법")
+        self.var_law = tk.StringVar(value="")   # 기본값 비움(예시값 오조회 방지)
         self.ent_law = ttk.Entry(top, textvariable=self.var_law, width=24)
         self.ent_law.grid(row=0, column=1, pady=(10, 4), sticky="w")
         self.var_law.trace_add("write", lambda *a: self.var_lawinfo.set(""))  # 법률명 바뀌면 확인표시 초기화
@@ -524,6 +561,8 @@ class App(tk.Tk):
         self.progress.pack(side="left", padx=8)
         self.btn_csv = ttk.Button(bottom, text="CSV 저장", command=self.save_csv, state="disabled")
         self.btn_csv.pack(side="left")
+        self.btn_amend = ttk.Button(bottom, text="✏️ 개정안 제안", command=self.on_amendment, state="disabled")
+        self.btn_amend.pack(side="left", padx=(6, 0))
 
         self.on_sido_change()  # 초기 시군구 목록 채우기
 
@@ -650,6 +689,7 @@ class App(tk.Tk):
         self.api = LawGoKrAPI(oc)
         self.btn_run.config(state="disabled")
         self.btn_csv.config(state="disabled")
+        self.btn_amend.config(state="disabled")
         self.tree.delete(*self.tree.get_children())
         self.rows = []
         self.progress.config(value=0)
@@ -791,6 +831,7 @@ class App(tk.Tk):
         self.progress.config(value=0)
         self.btn_run.config(state="normal")
         self.btn_csv.config(state="normal")
+        self.btn_amend.config(state="normal")
         self._draw_network(law_name)
 
     def _finish_empty(self, law_name, sido, sigungu, total):
@@ -927,6 +968,95 @@ class App(tk.Tk):
                             it["revision"], it["mst"]])
         self.var_status.set(f"CSV 저장 완료: {path}")
         messagebox.showinfo("저장 완료", f"{len(self.rows)}건을 저장했습니다.\n{path}")
+
+    # 개정안 제안 (OpenAI) — 옛 명칭 인용 조례를 어떻게 고칠지 신구대조표 -----
+    def on_amendment(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("개정안 제안", "표에서 조례를 한 건 선택하세요.\n"
+                                "(⚠ 옛 명칭을 인용하는 정비 대상 조례에 대해 제안됩니다.)")
+            return
+        idx = self.tree.index(sel[0])
+        if idx >= len(self.rows):
+            return
+        it = self.rows[idx]
+        cited = it.get("cited", "")
+        if not cited:
+            messagebox.showinfo("개정안 불필요",
+                "이 조례는 본문 미검증이거나 법령명 인용이 확인되지 않았습니다.\n"
+                "개정안은 ⚠ 옛 명칭을 인용하는 조례에 대해 제안됩니다.")
+            return
+        if cited == self.current_name:
+            messagebox.showinfo("개정안 불필요",
+                f"이 조례는 이미 현행 명칭(「{self.current_name}」)을 인용하고 있어\n"
+                "명칭 정비가 필요하지 않습니다.")
+            return
+        if not DEFAULT_OPENAI:
+            messagebox.showwarning("OpenAI 키 필요",
+                "개정안 생성에는 OpenAI API 키가 필요합니다.\n"
+                ".env 파일에 OPENAI_API_KEY 를 설정하세요(.env.example 참고).")
+            return
+        old_name, new_name = cited, self.current_name
+        self.btn_amend.config(state="disabled")
+        self.var_status.set(f"‘{it['name']}’ 개정안 생성 중… (OpenAI {OPENAI_MODEL})")
+
+        def work():
+            try:
+                _, arts = self.api.get_ordinance_articles(it["mst"])
+                hit = [(t, c) for (t, c) in arts if old_name in c]
+                if not hit:
+                    self._ui(lambda: (self.var_status.set("개정안: 옛 명칭이 본문에 없습니다"),
+                                      self.btn_amend.config(state="normal"),
+                                      messagebox.showinfo("개정안", "본문에서 옛 명칭을 찾지 못했습니다.")))
+                    return
+                result = generate_amendment(DEFAULT_OPENAI, it["name"], it["gov"], old_name, new_name, hit)
+                self._ui(lambda: self._show_amendment(it, old_name, new_name, result))
+            except Exception as e:
+                msg = str(e)
+                self._ui(lambda m=msg: (self.var_status.set("개정안 생성 실패"),
+                                        self.btn_amend.config(state="normal"),
+                                        messagebox.showerror("오류", "개정안 생성 실패:\n" + m)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_amendment(self, it, old_name, new_name, text):
+        self.var_status.set(f"‘{it['name']}’ 개정안 생성 완료")
+        self.btn_amend.config(state="normal")
+        dlg = tk.Toplevel(self)
+        dlg.title(f"개정안 — {it['name']}")
+        dlg.geometry("820x600")
+        dlg.transient(self)
+        ttk.Label(dlg, text=f"{it['name']}  ({it['gov']})",
+                  font=("Malgun Gothic", 12, "bold")).pack(anchor="w", padx=12, pady=(10, 2))
+        ttk.Label(dlg, text=f"명칭 정비:  「{old_name}」  →  「{new_name}」",
+                  foreground="#c62828").pack(anchor="w", padx=12, pady=(0, 8))
+        frm = ttk.Frame(dlg)
+        frm.pack(fill="both", expand=True, padx=12)
+        txt = tk.Text(frm, wrap="word", font=("Malgun Gothic", 10))
+        sb = ttk.Scrollbar(frm, command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        txt.pack(side="left", fill="both", expand=True)
+        sb.pack(side="left", fill="y")
+        txt.insert("1.0", text)
+        txt.configure(state="disabled")
+        bf = ttk.Frame(dlg)
+        bf.pack(fill="x", pady=8, padx=12)
+        ttk.Label(bf, text="⚠ AI가 만든 초안입니다. 반드시 원문·법제처와 대조 후 사용하세요.",
+                  foreground="#8a3b00").pack(side="left")
+
+        def save():
+            p = filedialog.asksaveasfilename(
+                defaultextension=".md",
+                initialfile=f"개정안_{it['gov']}_{it['name']}.md".replace(" ", "_"),
+                filetypes=[("Markdown", "*.md"), ("텍스트", "*.txt")])
+            if not p:
+                return
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(f"# 조례 명칭 정비 개정안\n\n"
+                        f"- 조례: {it['name']} ({it['gov']})\n"
+                        f"- 명칭 변경: 「{old_name}」 → 「{new_name}」\n\n{text}\n")
+            messagebox.showinfo("저장 완료", f"개정안을 저장했습니다.\n{p}")
+        ttk.Button(bf, text="저장(.md)", command=save).pack(side="right", padx=(8, 0))
+        ttk.Button(bf, text="닫기", command=dlg.destroy).pack(side="right")
 
     # 도움말 -------------------------------------------------------------
     def show_help(self):
