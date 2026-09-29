@@ -17,7 +17,7 @@ import shutil
 import sqlite3
 from datetime import datetime
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2   # 2: 현행 조문 전문(article_text)·대비표 초안(draft) 추가
 
 ST_NEW, ST_REVIEW, ST_MORE, ST_NONEED, ST_PUSH, ST_DONE = (
     "신규", "검토 중", "추가 확인", "정비 불필요", "정비 추진", "완료")
@@ -46,6 +46,8 @@ CREATE TABLE IF NOT EXISTS event(
 CREATE TABLE IF NOT EXISTS history(
   id INTEGER PRIMARY KEY, event_id INTEGER, at TEXT,
   field TEXT, old TEXT, new TEXT, note TEXT);
+CREATE TABLE IF NOT EXISTS draft(
+  event_id INTEGER PRIMARY KEY, kind TEXT, current_text TEXT, draft_text TEXT, memo TEXT, updated_at TEXT);
 CREATE TABLE IF NOT EXISTS scan_log(
   id INTEGER PRIMARY KEY, at TEXT, law_name TEXT, scope TEXT, source TEXT,
   n_found INTEGER, n_new INTEGER, n_dup INTEGER, n_relinked INTEGER, n_failed INTEGER, capped INTEGER);
@@ -70,6 +72,13 @@ class ReviewStore:
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(_SCHEMA)
+        self._migrate()
+
+    def _migrate(self):
+        """이전 버전 DB(v1)에 새 칸을 더한다. 기존 자료는 그대로 둔다."""
+        cols = {r[1] for r in self.db.execute("PRAGMA table_info(event)")}
+        if "article_text" not in cols:
+            self.db.execute("ALTER TABLE event ADD COLUMN article_text TEXT DEFAULT ''")
         self.db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         self.db.commit()
 
@@ -88,6 +97,12 @@ class ReviewStore:
             row = self.db.execute("SELECT id, ord_mst FROM event WHERE event_key=?", (key,)).fetchone()
             if row:
                 cnt["dup"] += 1
+                if r.get("article_text"):   # 재조회 시 최신 조문 전문으로 갱신(대비표 ‘현행’ 기준)
+                    self.db.execute("UPDATE event SET article_text=? WHERE id=?", (r["article_text"], row["id"]))
+                cur_dept = self.db.execute("SELECT dept FROM event WHERE id=?", (row["id"],)).fetchone()[0]
+                if r.get("dept") and not (cur_dept or "").strip():   # 담당부서가 비어 있을 때만 소관부서로 채움(담당자 입력은 유지)
+                    self.db.execute("UPDATE event SET dept=? WHERE id=?", (r["dept"], row["id"]))
+                    self._hist(row["id"], "dept", "", r["dept"], "소관부서 자동 입력(재조회)")
                 if (r.get("ord_mst") or "") != (row["ord_mst"] or ""):   # 조례 개정본 → 이력만 남김
                     self.db.execute("UPDATE event SET ord_mst=?, updated_at=? WHERE id=?",
                                     (r.get("ord_mst"), now, row["id"]))
@@ -99,12 +114,13 @@ class ReviewStore:
                 (r.get("law_id"), r.get("ord_id"), r.get("jo"), r.get("cited"), r.get("law_mst"))).fetchone()
             cur = self.db.execute(
                 "INSERT INTO event(event_key,law_name,law_id,law_mst,law_date,ord_name,ord_id,ord_mst,gov,kind,"
-                "jo,cited,is_old,snippet,source,fetched_at,status,dept,prev_event_id,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "jo,cited,is_old,snippet,source,fetched_at,status,dept,prev_event_id,created_at,updated_at,article_text) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (key, r.get("law_name"), r.get("law_id"), r.get("law_mst"), r.get("law_date"),
                  r.get("ord_name"), r.get("ord_id"), r.get("ord_mst"), r.get("gov"), r.get("kind"),
                  r.get("jo"), r.get("cited"), 1 if r.get("is_old") else 0, r.get("snippet"),
-                 source, now, ST_NEW, r.get("dept") or "", prev["id"] if prev else None, now, now))
+                 source, now, ST_NEW, r.get("dept") or "", prev["id"] if prev else None, now, now,
+                 r.get("article_text") or ""))
             note = f"법령 버전 변경 → 사건 #{prev['id']} 재검토" if prev else "신규 등록"
             self._hist(cur.lastrowid, "status", "", ST_NEW, note)
             cnt["relinked" if prev else "new"] += 1
@@ -141,10 +157,23 @@ class ReviewStore:
     def get(self, event_id):
         return self.db.execute("SELECT * FROM event WHERE id=?", (event_id,)).fetchone()
 
+    def get_by_key(self, key):
+        return self.db.execute("SELECT * FROM event WHERE event_key=?", (key,)).fetchone()
+
     def events(self):
         return self.db.execute(
             "SELECT * FROM event ORDER BY is_old DESC, CASE status WHEN '완료' THEN 1 WHEN '정비 불필요' THEN 1 "
             "ELSE 0 END, (due='' OR due IS NULL), due, gov, ord_name").fetchall()
+
+    def save_draft(self, event_id, kind, current_text, draft_text, memo):
+        """신구조문대비표 초안 저장(담당자 수정본). 후임자가 이어서 볼 수 있게 DB에 남긴다."""
+        self.db.execute("INSERT OR REPLACE INTO draft(event_id,kind,current_text,draft_text,memo,updated_at) "
+                        "VALUES(?,?,?,?,?,?)", (event_id, kind, current_text, draft_text, memo, _now()))
+        self._hist(event_id, "draft", "", kind, "대비표 초안 저장")
+        self.db.commit()
+
+    def get_draft(self, event_id):
+        return self.db.execute("SELECT * FROM draft WHERE event_id=?", (event_id,)).fetchone()
 
     def history(self, event_id):
         return self.db.execute("SELECT * FROM history WHERE event_id=? ORDER BY id", (event_id,)).fetchall()
@@ -191,7 +220,7 @@ class ReviewStore:
             src.execute("SELECT id, event_key, status FROM event LIMIT 1")
         except sqlite3.Error as e:
             raise ReviewError(f"복원 파일을 읽을 수 없습니다(현재 자료 유지): {e}")
-        if ver != SCHEMA_VERSION or not {"event", "history"} <= names:
+        if ver not in (1, SCHEMA_VERSION) or not {"event", "history"} <= names:
             src.close()
             raise ReviewError("복원 파일 형식이 맞지 않습니다(현재 자료 유지).")
         tmp = self.path + ".restore_tmp"
@@ -205,6 +234,8 @@ class ReviewStore:
         os.replace(tmp, self.path)
         self.db = sqlite3.connect(self.path)
         self.db.row_factory = sqlite3.Row
+        self.db.executescript(_SCHEMA)
+        self._migrate()
 
 
 def csv_safe(v):
@@ -226,5 +257,6 @@ def records_from_rows(rows, law_name, law_info, current_name):
                 "ord_name": it.get("name"), "ord_id": it.get("ord_id"), "ord_mst": it.get("mst"),
                 "gov": it.get("gov"), "kind": it.get("kind"), "jo": c["jo"], "cited": c["term"],
                 "is_old": c["term"] != current_name, "snippet": c["snippet"], "dept": it.get("dept", ""),
+                "article_text": c.get("text", ""),
             })
     return out

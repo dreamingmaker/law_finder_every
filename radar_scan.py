@@ -21,12 +21,14 @@ import csv
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 from collections import Counter, defaultdict
 from datetime import datetime
 
 import law_ordinance_network as lon
+import revision as R
 from review_store import ReviewStore, csv_safe
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -97,7 +99,11 @@ def scan_law(api, law, org, max_count=1000, log=print):
             merged.setdefault(mst, it)
     log(f"  검색: " + ", ".join(f"{t} {n}건" for t, n in hits_by_term.items()) + f" → 자치법규 {len(merged)}건")
 
-    records, failed, seen = [], [], set()
+    try:   # 유형② 조문 인용 점검용 현행 조문 목록(법령당 1회 조회)
+        law_arts = api.get_law_articles(law["mst"]) if law.get("mst") else []
+    except Exception:
+        law_arts = []
+    records, failed, seen, ref_rows = [], [], set(), []
     for i, it in enumerate(merged.values(), 1):
         try:
             meta, arts = api.get_ordinance_articles(it["mst"])
@@ -107,6 +113,11 @@ def scan_law(api, law, org, max_count=1000, log=print):
         if not arts:
             failed.append({**it, "error": "조문 없음(지원하지 않는 원문 구조)"})
             continue
+        dept = (meta or {}).get("dept", "")
+        if law_arts:
+            for r in R.check_refs(R.find_law_refs(arts, terms), law_arts, law["name"]):
+                ref_rows.append({**r, "law_name": law["name"], "gov": it["gov"], "dept": dept, "ord_name": it["name"],
+                                 "ord_id": it["ord_id"], "ord_mst": it["mst"]})
         for c in lon.find_citations(arts, terms):
             k = (it["ord_id"], c["jo"], c["term"])   # 같은 조문 안 반복 인용·같은 조례의 다른 버전은 1건
             if k in seen:
@@ -115,7 +126,7 @@ def scan_law(api, law, org, max_count=1000, log=print):
             records.append({
                 "law_name": law["name"], "law_id": law["law_id"], "law_mst": law["mst"],
                 "law_date": law["promulgation"], "ord_name": it["name"], "ord_id": it["ord_id"],
-                "ord_mst": it["mst"], "gov": it["gov"], "dept": (meta or {}).get("dept", ""),
+                "ord_mst": it["mst"], "gov": it["gov"], "dept": dept, "article_text": c.get("text", ""),
                 "kind": it["kind"], "enforce": it["enforce"],
                 "jo": c["jo"], "cited": c["term"], "cited_kind": kinds.get(c["term"], "추가어"),
                 "is_old": kinds.get(c["term"], "").startswith("이전명"), "purpose": c["purpose"], "snippet": c["snippet"],
@@ -123,8 +134,18 @@ def scan_law(api, law, org, max_count=1000, log=print):
         if i % 20 == 0:
             log(f"  본문 확인 {i}/{len(merged)}")
 
+    # 부서 간 정비 사각지대 후보: 같은 기관에서 이 법을 제1조(목적) 근거로 삼는 조례의 소관부서를 ‘법령 담당 부서(추정)’로 보고,
+    # 그 밖의 부서 소관 조례에서 이 법을 인용한 경우를 표시한다(추정 — 담당자 확인 대상).
+    lawside = defaultdict(set)
+    for r in records:
+        if r["purpose"] and r["dept"]:
+            lawside[r["gov"]].add(r["dept"])
+    for r in records:
+        r["lawside_dept"] = ", ".join(sorted(lawside[r["gov"]]))
+        r["cross_dept"] = bool(r["dept"] and lawside[r["gov"]] and r["dept"] not in lawside[r["gov"]])
     old = [r for r in records if r["is_old"]]
     citing = {r["ord_id"] for r in records}
+    seoul = [r for r in records if r["gov"] == "서울특별시"]
     summary = {
         "법령": law["name"], "법령ID": law["law_id"], "법령버전(MST)": law["mst"], "공포일": law["promulgation"],
         "이전명": ", ".join([law["prev_name"]] * bool(law["prev_name"]) + [e for e in extra if e != law["prev_name"]]),
@@ -134,8 +155,18 @@ def scan_law(api, law, org, max_count=1000, log=print):
         "이전명_인용_조문": len(old), "이전명_인용_자치법규": len({r["ord_id"] for r in old}),
         "이전명_인용_기관": dict(Counter(r["gov"] for r in {r["ord_id"]: r for r in old}.values())),
         "목적조항_근거": len({r["ord_id"] for r in records if r["purpose"]}),
+        "본청_인용_자치법규": len({r["ord_id"] for r in seoul}),
+        "본청_인용_소관부서수": len({r["dept"] for r in seoul if r["dept"]}),
+        "본청_법령담당부서(추정)": sorted(lawside["서울특별시"]),
+        "타부서_인용_자치법규": len({r["ord_id"] for r in records if r["cross_dept"]}),
+        "타부서_옛이름_인용_자치법규": len({r["ord_id"] for r in old if r["cross_dept"]}),
+        "소관부서_미확인_자치법규": len({r["ord_id"] for r in records if not r["dept"]}),
+        "조문인용_점검건수": len(ref_rows),
+        "현행에_없는_조문_인용": sum(1 for r in ref_rows if "없음" in r["status"]),
+        "옛이름_조문번호_대조필요": sum(1 for r in ref_rows if "내용 대조" in r["status"]),
+        "현행조문목록_조회": bool(law_arts),
     }
-    return records, failed, summary
+    return records, failed, summary, ref_rows
 
 
 def main(argv=None):
@@ -165,7 +196,7 @@ def main(argv=None):
     store = ReviewStore(a.db)
     started = datetime.now()
     t0 = time.time()
-    all_rec, all_fail, per_law = [], [], []
+    all_rec, all_fail, per_law, all_refs = [], [], [], []
     for n, extra in names:
         print(f"■ {n}" + (f"  (+옛 이름 {', '.join(extra)})" if extra else ""))
         t1 = time.time()
@@ -182,7 +213,8 @@ def main(argv=None):
             print("  ⚠ 이전 법령명 조회 실패(목록 파일의 옛 이름만 사용): " + law["meta_error"])
         if not law["prev_name"] and not extra:
             print("  이전 법령명 없음(제명변경 이력 없음) — 현행명·약칭만 점검")
-        rec, fail, s = scan_law(api, law, org, a.max)
+        rec, fail, s, refs = scan_law(api, law, org, a.max)
+        all_refs += refs
         cnt = store.register(rec, "API", law_name=law["name"], scope=sido, n_failed=len(fail),
                              capped=s["수집_상한_도달"])
         s["검토카드_등록"] = cnt
@@ -194,10 +226,10 @@ def main(argv=None):
         per_law.append(s)
 
     with open(os.path.join(out, "인용목록.csv"), "w", encoding="utf-8-sig", newline="") as f:
-        cols = ["law_name", "gov", "dept", "ord_name", "kind", "jo", "cited", "cited_kind", "purpose", "snippet",
+        cols = ["law_name", "gov", "dept", "cross_dept", "lawside_dept", "ord_name", "kind", "jo", "cited", "cited_kind", "purpose", "snippet",
                 "enforce", "ord_id", "ord_mst", "law_mst"]
         w = csv.writer(f)
-        w.writerow(["법령", "지자체", "소관부서", "자치법규명", "종류", "인용조문", "인용명칭", "명칭구분", "목적조항",
+        w.writerow(["법령", "지자체", "소관부서", "타부서 인용(추정)", "법령 담당부서(추정)", "자치법규명", "종류", "인용조문", "인용명칭", "명칭구분", "목적조항",
                     "인용문장", "시행일", "자치법규ID", "자치법규MST", "법령MST"])
         for r in all_rec:
             w.writerow([csv_safe(r[c]) for c in cols])
@@ -206,6 +238,50 @@ def main(argv=None):
         w.writerow(["법령", "지자체", "자치법규명", "자치법규MST", "사유"])
         for r in all_fail:
             w.writerow([csv_safe(x) for x in (r["law_name"], r["gov"], r["name"], r["mst"], r["error"])])
+
+    with open(os.path.join(out, "조문인용점검.csv"), "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["법령", "지자체", "소관부서", "자치법규명", "조례 조문", "인용", "판정", "현행 조문 제목", "대체 후보(확인 필요)"])
+        for r in all_refs:
+            c = r.get("candidate")
+            w.writerow([csv_safe(x) for x in (r["law_name"], r["gov"], r["dept"], r["ord_name"], r["ord_jo"], r["text"], r["status"],
+                                             r.get("current_title", ""), f"{c['label']} {c['title']} ({c['why']})" if c else "")])
+
+    # 유형② 대비표 초안 자동 작성: 옛 법령명 인용 조문 + 현행 법에 없는 조문을 인용한 조문
+    ddir = os.path.join(out, "대비표초안"); os.makedirs(ddir, exist_ok=True)
+    targets = {}
+    for r in all_rec:
+        if r["is_old"]:
+            targets.setdefault((r["law_name"], r["ord_mst"], r["jo"]), {"rec": r, "cited": set()})["cited"].add(r["cited"])
+    for r in all_refs:
+        if "없음" in r["status"]:
+            rec = next((x for x in all_rec if x["ord_mst"] == r["ord_mst"] and x["jo"] == r["ord_jo"] and x["law_name"] == r["law_name"]), None)
+            if rec:
+                targets.setdefault((r["law_name"], r["ord_mst"], r["ord_jo"]), {"rec": rec, "cited": set()})
+    t_draft = time.time()
+    index = []
+    for (law_name, mst, jo), v in targets.items():
+        r = v["rec"]
+        refs = [x for x in all_refs if x["ord_mst"] == mst and x["ord_jo"] == jo and x["law_name"] == law_name]
+        new, basis, checks = R.auto_type2_draft(r["article_text"], law_name, sorted(v["cited"]), refs)
+        name = r["ord_name"] if r["ord_name"].startswith(r["gov"]) else f"{r['gov']}_{r['ord_name']}"   # 기관명 중복 방지
+        base = re.sub(r"[\\/:*?\"<>|\s]+", "_", f"{name}_{jo}")[:120]
+        srcn = f"현행 조문 출처: 법제처 국가법령정보 공동활용, 조회 {started:%Y-%m-%d %H:%M}, 자치법규 MST {mst}"
+        R.export_comparison(os.path.join(ddir, f"신구조문대비표_초안_{base}.html"), r["ord_name"], [(r["article_text"], new)], srcn)
+        reason = (f"상위법 명칭 변경(「{'」·「'.join(sorted(v['cited']))}」 → 「{law_name}」)에 따른 인용 정비" if v["cited"]
+                  else "상위법 조문 삭제·이동 의심에 따른 인용 확인")
+        memo = R.build_memo("유형② 변경된 법령명·조문 인용 정비", r["ord_name"], r["gov"], r["dept"], law_name, basis, reason,
+                            list(dict.fromkeys(checks + (["부서 간 정비 사각지대 후보: 법령 담당부서(추정) " + r["lawside_dept"] + "와 소관부서가 다름"]
+                                                         if r["cross_dept"] else []))), srcn)
+        with open(os.path.join(ddir, f"검토메모_{base}.txt"), "w", encoding="utf-8") as f:
+            f.write(memo)
+        index.append([law_name, r["gov"], r["dept"], "예" if r["cross_dept"] else "", r["lawside_dept"], r["ord_name"], jo,
+                      "·".join(sorted(v["cited"])) or "-", len(refs), sum(1 for x in refs if "없음" in x["status"])])
+    draft_sec = round(time.time() - t_draft, 2)
+    with open(os.path.join(ddir, "대비표초안_목록.csv"), "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["법령", "지자체", "소관부서", "타부서 인용(추정)", "법령 담당부서(추정)", "자치법규명", "조문", "옛 법령명", "조문인용 수", "현행에 없는 조문 인용"])
+        w.writerows([[csv_safe(x) for x in row] for row in index])
 
     src = os.path.join(HERE, "law_ordinance_network.py")
     old_by_gov = defaultdict(int)
@@ -221,6 +297,10 @@ def main(argv=None):
         "이전명_인용_조문": sum(s.get("이전명_인용_조문", 0) for s in per_law),
         "이전명_인용_기관수": len(old_by_gov), "미검증": len(all_fail),
         "수집_상한_도달_법령": [s["법령"] for s in per_law if s.get("수집_상한_도달")],
+        "타부서_인용_자치법규(법령별 합)": sum(s.get("타부서_인용_자치법규", 0) for s in per_law),
+        "타부서_옛이름_인용_자치법규(법령별 합)": sum(s.get("타부서_옛이름_인용_자치법규", 0) for s in per_law),
+        "조문인용_점검건수": len(all_refs), "현행에_없는_조문_인용": sum(1 for r in all_refs if "없음" in r["status"]),
+        "대비표초안_작성건수": len(index), "대비표초안_타부서건수": sum(1 for x in index if x[3]), "대비표초안_생성초": draft_sec,
         "총_소요초": round(time.time() - t0, 1), "API_호출수": api.calls,
         "프로그램_sha256": hashlib.sha256(open(src, "rb").read()).hexdigest(),
     }
@@ -236,6 +316,12 @@ def main(argv=None):
         md.append(f"| {s['법령']} | {s['이전명'] or '-'} | {s['대상_자치법규']} | {s['인용_자치법규']} | "
                   f"{s['이전명_인용_자치법규']}/{s['이전명_인용_조문']} | {s['미검증']} | "
                   f"{'도달' if s['수집_상한_도달'] else '-'} | {s['소요초']} |")
+    md += ["", "| 법령 | 본청 인용 자치법규 | 본청 소관부서 수 | 본청 법령 담당부서(추정) | 타부서 인용 | 타부서 옛 이름 인용 | 현행에 없는 조문 인용 |",
+           "|---|---|---|---|---|---|---|"]
+    for s in per_law:
+        if "오류" not in s:
+            md.append(f"| {s['법령']} | {s['본청_인용_자치법규']} | {s['본청_인용_소관부서수']} | {', '.join(s['본청_법령담당부서(추정)']) or '-'} | "
+                      f"{s['타부서_인용_자치법규']} | {s['타부서_옛이름_인용_자치법규']} | {s['현행에_없는_조문_인용']} |")
     md += ["", "```json", json.dumps(total, ensure_ascii=False, indent=2), "```"]
     with open(os.path.join(out, "요약.md"), "w", encoding="utf-8") as f:
         f.write("\n".join(md))

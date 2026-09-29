@@ -5,10 +5,11 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
 from review_store import STATUSES, ALLOWED, ReviewError
+from draft_window import DraftWindow
 
 
 FIELD_KO = {"status": "상태", "dept": "담당부서", "due": "기한", "reason": "판단 사유",
-            "reviewer": "확인자", "ord_mst": "조례 버전"}
+            "reviewer": "확인자", "ord_mst": "조례 버전", "draft": "대비표 초안"}
 
 
 class ReviewWindow(tk.Toplevel):
@@ -18,9 +19,10 @@ class ReviewWindow(tk.Toplevel):
     WIDTHS = {"id": 46, "gov": 120, "ord_name": 250, "jo": 70, "cited": 170, "status": 76,
               "dept": 100, "due": 84, "source": 60}
 
-    def __init__(self, master, store, current_name=""):
+    def __init__(self, master, store, current_name="", api_factory=None):
         super().__init__(master)
         self.store = store
+        self.api_factory = api_factory
         self.current_name = current_name
         self.title("📋 검토카드 — 찾은 인용마다 1장: 담당부서·기한·판단 사유·이력")
         self.geometry("1180x700")
@@ -33,6 +35,7 @@ class ReviewWindow(tk.Toplevel):
         self.var_stat = tk.StringVar()
         ttk.Label(top, textvariable=self.var_stat, foreground="#1565c0").pack(side="left")
         ttk.Button(top, text="CSV 내보내기", command=self.export).pack(side="right")
+        ttk.Button(top, text="📝 대비표 초안", command=self.open_draft).pack(side="right", padx=4)
         ttk.Button(top, text="백업", command=self.backup).pack(side="right", padx=4)
 
         pan = ttk.Panedwindow(self, orient="vertical")
@@ -136,6 +139,12 @@ class ReviewWindow(tk.Toplevel):
         self.refresh()
         self.tree.selection_set(str(sid))
         self.tree.see(str(sid))
+
+    def open_draft(self):
+        if self.sel_id is None:
+            messagebox.showinfo("대비표 초안", "목록에서 검토카드를 한 장 선택하세요.", parent=self)
+            return
+        DraftWindow(self, self.store, self.store.get(self.sel_id), self.api_factory)
 
     def export(self):
         p = filedialog.asksaveasfilename(parent=self, defaultextension=".csv", initialfile="검토카드.csv",

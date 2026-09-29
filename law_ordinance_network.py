@@ -38,6 +38,8 @@ from urllib.parse import urlencode
 import requests
 
 from review_store import ReviewStore, records_from_rows
+from ai_review import obligation_articles  # noqa: F401  (유형① 후보 선별 규칙 — 시험·외부 사용)
+from revision import law_article_label
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -53,6 +55,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import networkx as nx
 
 from review_window import ReviewWindow
+from ai_window import AIReviewWindow
 
 # Windows/공통 한글 폰트 지정 (없으면 기본값)
 for _f in ("Malgun Gothic", "맑은 고딕", "NanumGothic", "AppleGothic", "Gulim"):
@@ -150,42 +153,6 @@ def generate_amendment(api_key, ordinance_name, gov, old_name, new_name, cited_a
         OPENAI_URL,
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         json=payload, timeout=120)
-    if resp.status_code != 200:
-        raise RuntimeError(f"OpenAI API 오류 {resp.status_code}: {resp.text[:300]}")
-    return resp.json()["choices"][0]["message"]["content"].strip()
-
-
-# 빠진 조문(공백) 점검 — 법이 지자체에 '하여야 한다'고 정한 조항 중 조례에 대응 조항이 없는 곳 ---------
-OBLIG_RE = re.compile(r"하여야 한다|해야 한다")
-LOCAL_RE = re.compile(r"지방자치단체|국가기관등|시ㆍ도지사|시·도지사|시장ㆍ군수ㆍ구청장|시장·군수·구청장|구청장")
-
-
-def obligation_articles(law_articles):
-    """AI에 보내기 전에, 지자체(국가기관등 포함)가 주어인 의무 조항만 규칙으로 골라낸다."""
-    return [a for a in law_articles
-            if OBLIG_RE.search(a.get("content") or "") and LOCAL_RE.search(a.get("content") or "")]
-
-
-def find_gaps(api_key, law_name, obligations, ordinance_name, gov, ord_articles, model=OPENAI_MODEL):
-    """법의 의무 조항(obligations)을 조례 조문과 1:1 대조해 '반영/공백/확인 필요' 표를 만든다(생성형 AI)."""
-    law_txt = "\n".join(f"제{a['no']}조({a.get('title', '')}) {(a.get('content') or '').replace(chr(10), ' ')[:400]}"
-                        for a in obligations)
-    ord_txt = "\n".join(f"[{t or '조문'}] {c.replace(chr(10), ' ')[:400]}" for t, c in ord_articles)
-    system = (
-        "당신은 지방자치단체 자치법규 정비 담당자를 돕는 검토 보조자다. "
-        "상위법이 지방자치단체(국가기관등 포함)에 '하여야 한다'고 정한 의무 조항마다, 조례에 대응하는 조항이 있는지 대조한다.\n"
-        "원칙: 1) 주어진 원문만 근거로 한다. 2) 목록에 없는 조문번호를 만들지 않는다. "
-        "3) 확신이 없으면 '확인 필요'. 4) 법률 판단(위법 여부)은 하지 않는다.\n"
-        "출력 형식(이외 금지):\n| 법 조문 | 의무 내용(한 줄) | 조례 대응 조문 | 판단 | 개정 방향(초안) |\n"
-        "판단은 '반영' / '공백' / '확인 필요' 중 하나. 표 다음 줄에 '점검 요약: ...' 한 줄."
-    )
-    user = (f"상위법: 「{law_name}」\n조례: {ordinance_name} ({gov})\n\n"
-            f"[상위법 의무 조항]\n{law_txt}\n\n[조례 전체 조문]\n{ord_txt}\n\n"
-            "각 의무 조항에 대응하는 조례 조항이 있는지 표로 정리해줘.")
-    payload = {"model": model, "temperature": 0.1,
-               "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
-    resp = requests.post(OPENAI_URL, headers={"Authorization": f"Bearer {api_key}",
-                                              "Content-Type": "application/json"}, json=payload, timeout=180)
     if resp.status_code != 200:
         raise RuntimeError(f"OpenAI API 오류 {resp.status_code}: {resp.text[:300]}")
     return resp.json()["choices"][0]["message"]["content"].strip()
@@ -355,6 +322,7 @@ class LawGoKrAPI:
             "changed": _ftext(src, "제명변경여부"),
             "ministry": _ftext(src, "소관부처", "소관부처명"),
             "law_id": _ftext(src, "법령ID"),
+            "enforce": _ftext(src, "시행일자"),
         }
 
     # 법령 조문 목록 (번호·제목·이동이력) — 끊어진 참조(7-5-4) 추적용 --------
@@ -370,8 +338,10 @@ class LawGoKrAPI:
             for sub in jo.iter():
                 if sub.tag in ("항내용", "호내용", "목내용") and sub.text:
                     parts.append(sub.text.strip())
+            no, br = _ftext(jo, "조문번호"), _ftext(jo, "조문가지번호")
             arts.append({
-                "no": _ftext(jo, "조문번호"),
+                "no": no,
+                "key": f"{no}의{br}" if br and br != "0" else no,   # 제9조의2 → "9의2"
                 "title": _ftext(jo, "조문제목"),
                 "moved_from": _ftext(jo, "조문이동이전"),
                 "moved_to": _ftext(jo, "조문이동이후"),
@@ -505,7 +475,8 @@ def find_citations(articles, law_terms):
                 if any(s < e2 and s2 < e for s2, e2 in spans):
                     continue
                 spans.append((s, e))
-                found.append({"jo": jo, "term": t, "snippet": _snippet(content, t), "purpose": purpose})
+                found.append({"jo": jo, "term": t, "snippet": _snippet(content, t), "purpose": purpose,
+                              "text": content})
     return found
 
 
@@ -674,7 +645,7 @@ class App(tk.Tk):
         self.btn_csv.pack(side="left")
         self.btn_amend = ttk.Button(bottom, text="✏️ 개정안 제안", command=self.on_amendment, state="disabled")
         self.btn_amend.pack(side="left", padx=(6, 0))
-        self.btn_gap = ttk.Button(bottom, text="🧩 빠진 조문 점검(AI)", command=self.on_gap, state="disabled")
+        self.btn_gap = ttk.Button(bottom, text="🧩 AI 검토(의무·위임/취지)", command=self.on_gap, state="disabled")
         self.btn_gap.pack(side="left", padx=(6, 0))
         self.btn_reg = ttk.Button(bottom, text="📋 검토카드 등록", command=self.on_register, state="disabled")
         self.btn_reg.pack(side="left", padx=(6, 0))
@@ -840,6 +811,7 @@ class App(tk.Tk):
                         try:
                             meta = self.api.get_law_meta(pick["mst"])
                             prev_name = meta.get("prev_name", "")
+                            self.law_enforce = meta.get("enforce", "")
                             alias = meta.get("alias", "")
                         except Exception:
                             pass
@@ -1149,7 +1121,7 @@ class App(tk.Tk):
                 result = generate_amendment(DEFAULT_OPENAI, it["name"], it["gov"],
                                             old_name, new_name, hit, law_articles=law_arts)
                 known = {m.group(1)[1:] for _, c in arts for m in [_JO_RE.match(c)] if m}
-                known |= {f"{a['no']}조" for a in (law_arts or []) if a.get("no")}
+                known |= {law_article_label(a) for a in (law_arts or [])}
                 unknown = unverified_article_refs(result, known)
                 self._ui(lambda: self._show_amendment(it, old_name, new_name, result, unknown))
             except Exception as e:
@@ -1202,78 +1174,23 @@ class App(tk.Tk):
         ttk.Button(bf, text="저장(.md)", command=save).pack(side="right", padx=(8, 0))
         ttk.Button(bf, text="닫기", command=dlg.destroy).pack(side="right")
 
-    # 빠진 조문 점검 (생성형 AI) — 법의 의무 조항 ↔ 조례 대조 ----------------
+    # AI 검토 (유형① 의무·위임 / 유형③ 취지·현실 — 시범) → 채택 시 대비표 초안 ------------
     def on_gap(self):
         sel = self.tree.selection()
         if not sel:
-            messagebox.showinfo("빠진 조문 점검", "표에서 조례를 한 건 선택하세요.")
+            messagebox.showinfo("AI 검토", "표에서 조례를 한 건 선택하세요.")
             return
-        it = self.rows[self.tree.index(sel[0])]
-        mst_law = (self.law_info or {}).get("mst")
-        if not mst_law:
-            messagebox.showinfo("빠진 조문 점검", "법령 정보를 확인하지 못했습니다. [🔎 법령 확인] 후 다시 조회하세요.")
+        if not (self.law_info or {}).get("mst"):
+            messagebox.showinfo("AI 검토", "법령 정보를 확인하지 못했습니다. [🔎 법령 확인] 후 다시 조회하세요.")
             return
         if not DEFAULT_OPENAI:
-            messagebox.showwarning("OpenAI 키 필요", "빠진 조문 점검에는 OpenAI API 키가 필요합니다.\n"
+            messagebox.showwarning("OpenAI 키 필요", "AI 검토에는 OpenAI API 키가 필요합니다.\n"
                                    ".env 파일에 OPENAI_API_KEY 를 설정하세요(.env.example 참고).")
             return
-        self.btn_gap.config(state="disabled")
-        self.var_status.set(f"‘{it['name']}’ 빠진 조문 점검 중… (법 의무 조항 ↔ 조례 대조)")
-
-        def work():
-            try:
-                law_arts = self.api.get_law_articles(mst_law)
-                obl = obligation_articles(law_arts)
-                if not obl:
-                    self._ui(lambda: (self.btn_gap.config(state="normal"),
-                                      self.var_status.set("빠진 조문 점검: 지자체 의무 조항 없음"),
-                                      messagebox.showinfo("빠진 조문 점검",
-                                                          "이 법에서 지방자치단체에 ‘하여야 한다’고 정한 조항을 찾지 못했습니다.")))
-                    return
-                _, arts = self.api.get_ordinance_articles(it["mst"])
-                result = find_gaps(DEFAULT_OPENAI, self.current_name, obl, it["name"], it["gov"], arts)
-                known = {m.group(1)[1:] for _, c in arts for m in [_JO_RE.match(c)] if m}
-                known |= {f"{a['no']}조" for a in law_arts if a.get("no")}
-                unknown = unverified_article_refs(result, known)
-                head = f"「{self.current_name}」 의무 조항 {len(obl)}개 ↔ {it['name']}"
-                self._ui(lambda: self._show_ai_result(f"빠진 조문 점검 — {it['name']}", head, result, unknown,
-                                                      f"빠진조문점검_{it['gov']}_{it['name']}.md"))
-            except Exception as e:
-                msg = str(e)
-                self._ui(lambda m=msg: (self.var_status.set("빠진 조문 점검 실패"),
-                                        messagebox.showerror("오류", "빠진 조문 점검 실패:\n" + m)))
-            finally:
-                self._ui(lambda: self.btn_gap.config(state="normal"))
-        threading.Thread(target=work, daemon=True).start()
-
-    def _show_ai_result(self, title, head, text, unknown, save_name):
-        self.var_status.set(title + " 완료")
-        dlg = tk.Toplevel(self)
-        dlg.title(title)
-        dlg.geometry("900x620")
-        dlg.transient(self)
-        ttk.Label(dlg, text=head, font=("Malgun Gothic", 11, "bold")).pack(anchor="w", padx=12, pady=(10, 4))
-        if unknown:
-            ttk.Label(dlg, text="⚠ 확인 필요 — 원문에 없는 조문번호: " + ", ".join("제" + u for u in unknown),
-                      foreground="#b71c1c").pack(anchor="w", padx=12, pady=(0, 6))
-        txt = tk.Text(dlg, wrap="word", font=("Malgun Gothic", 10))
-        txt.pack(fill="both", expand=True, padx=12)
-        txt.insert("1.0", text)
-        txt.configure(state="disabled")
-        bf = ttk.Frame(dlg)
-        bf.pack(fill="x", pady=8, padx=12)
-        ttk.Label(bf, text="⚠ AI 초안입니다. 개정 여부는 소관부서·법무담당관이 원문으로 확인 후 판단하세요.",
-                  foreground="#8a3b00").pack(side="left")
-
-        def save():
-            p = filedialog.asksaveasfilename(defaultextension=".md", initialfile=save_name.replace(" ", "_"),
-                                             filetypes=[("Markdown", "*.md"), ("텍스트", "*.txt")])
-            if p:
-                with open(p, "w", encoding="utf-8") as f:
-                    f.write(f"# {title}\n\n- {head}\n\n{text}\n")
-                messagebox.showinfo("저장 완료", f"저장했습니다.\n{p}")
-        ttk.Button(bf, text="저장(.md)", command=save).pack(side="right", padx=(8, 0))
-        ttk.Button(bf, text="닫기", command=dlg.destroy).pack(side="right")
+        it = self.rows[self.tree.index(sel[0])]
+        AIReviewWindow(self, {"api": self.api, "api_key": DEFAULT_OPENAI, "store": self._store(), "row": it,
+                              "law_name": self.current_name, "law_mst": self.law_info["mst"],
+                              "law_id": self.law_info.get("law_id", ""), "law_enforce": getattr(self, "law_enforce", "")})
 
     # 도움말 -------------------------------------------------------------
     def show_help(self):
@@ -1298,7 +1215,9 @@ class App(tk.Tk):
             "■ 부서 서무 주임(왕서무)용\n"
             "  · ‘소관부서’ 칸에 부서명(예: 자원순환과)을 넣으면 우리 부서 조례만 보여 줍니다(전부 본문 확인).\n"
             "  · [📋 검토카드 등록] 시 소관부서가 담당부서로 미리 채워집니다.\n"
-            "  · [🧩 빠진 조문 점검(AI)]: 법이 지자체에 ‘하여야 한다’고 정한 조항과 조례를 AI가 대조합니다.\n\n"
+            "  · [📋 검토카드 열기] → [📝 대비표 초안]: 현행 조문과 정비 근거(삭제·이동 조문 점검)를 보고\n"
+            "    개정안을 고친 뒤, 한글에서 여는 대비표와 검토 메모로 내보냅니다(담당자 검토 전 ‘초안’).\n"
+            "  · [🧩 AI 검토]: 유형① 의무·위임 반영 여부 / 유형③ 취지·현실 적합성(시범). 채택한 항목만 대비표 초안으로.\n\n"
             "■ 검증(CoVe)\n"
             "  검색 결과를 그대로 믿지 않고 조례 본문 원문을 다시 대조합니다.\n"
             "  건수가 많으면 ‘검증 상위 N건’만 본문을 확인하고 나머지는 ‘단순매칭’으로 둡니다."
@@ -1340,7 +1259,11 @@ class App(tk.Tk):
         self.on_open_review()
 
     def on_open_review(self):
-        ReviewWindow(self, self._store(), self.current_name)
+        ReviewWindow(self, self._store(), self.current_name, api_factory=self._api_for_draft)
+
+    def _api_for_draft(self):
+        """대비표 초안 창에서 현행 법령 조문을 조회할 API (조회 전이면 .env 인증키로 생성)."""
+        return self.api or LawGoKrAPI(self.var_oc.get().strip() or DEFAULT_OC)
 
     # 스레드 → UI 안전 호출 / 진행률 ------------------------------------
     def _ui(self, fn):
