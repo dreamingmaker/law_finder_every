@@ -53,3 +53,8 @@ desktop.ini
 .DS_Store
 .vscode/
 .idea/
+
+# 조례정비 레이더 로컬 자료
+radar.db
+radar.db.*
+실측결과_*/

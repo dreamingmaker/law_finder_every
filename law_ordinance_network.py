@@ -37,6 +37,8 @@ from urllib.parse import urlencode
 
 import requests
 
+from review_store import ReviewStore, records_from_rows
+
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
@@ -49,6 +51,8 @@ from matplotlib import rcParams
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import networkx as nx
+
+from review_window import ReviewWindow
 
 # Windows/공통 한글 폰트 지정 (없으면 기본값)
 for _f in ("Malgun Gothic", "맑은 고딕", "NanumGothic", "AppleGothic", "Gulim"):
@@ -149,6 +153,49 @@ def generate_amendment(api_key, ordinance_name, gov, old_name, new_name, cited_a
     if resp.status_code != 200:
         raise RuntimeError(f"OpenAI API 오류 {resp.status_code}: {resp.text[:300]}")
     return resp.json()["choices"][0]["message"]["content"].strip()
+
+
+# 빠진 조문(공백) 점검 — 법이 지자체에 '하여야 한다'고 정한 조항 중 조례에 대응 조항이 없는 곳 ---------
+OBLIG_RE = re.compile(r"하여야 한다|해야 한다")
+LOCAL_RE = re.compile(r"지방자치단체|국가기관등|시ㆍ도지사|시·도지사|시장ㆍ군수ㆍ구청장|시장·군수·구청장|구청장")
+
+
+def obligation_articles(law_articles):
+    """AI에 보내기 전에, 지자체(국가기관등 포함)가 주어인 의무 조항만 규칙으로 골라낸다."""
+    return [a for a in law_articles
+            if OBLIG_RE.search(a.get("content") or "") and LOCAL_RE.search(a.get("content") or "")]
+
+
+def find_gaps(api_key, law_name, obligations, ordinance_name, gov, ord_articles, model=OPENAI_MODEL):
+    """법의 의무 조항(obligations)을 조례 조문과 1:1 대조해 '반영/공백/확인 필요' 표를 만든다(생성형 AI)."""
+    law_txt = "\n".join(f"제{a['no']}조({a.get('title', '')}) {(a.get('content') or '').replace(chr(10), ' ')[:400]}"
+                        for a in obligations)
+    ord_txt = "\n".join(f"[{t or '조문'}] {c.replace(chr(10), ' ')[:400]}" for t, c in ord_articles)
+    system = (
+        "당신은 지방자치단체 자치법규 정비 담당자를 돕는 검토 보조자다. "
+        "상위법이 지방자치단체(국가기관등 포함)에 '하여야 한다'고 정한 의무 조항마다, 조례에 대응하는 조항이 있는지 대조한다.\n"
+        "원칙: 1) 주어진 원문만 근거로 한다. 2) 목록에 없는 조문번호를 만들지 않는다. "
+        "3) 확신이 없으면 '확인 필요'. 4) 법률 판단(위법 여부)은 하지 않는다.\n"
+        "출력 형식(이외 금지):\n| 법 조문 | 의무 내용(한 줄) | 조례 대응 조문 | 판단 | 개정 방향(초안) |\n"
+        "판단은 '반영' / '공백' / '확인 필요' 중 하나. 표 다음 줄에 '점검 요약: ...' 한 줄."
+    )
+    user = (f"상위법: 「{law_name}」\n조례: {ordinance_name} ({gov})\n\n"
+            f"[상위법 의무 조항]\n{law_txt}\n\n[조례 전체 조문]\n{ord_txt}\n\n"
+            "각 의무 조항에 대응하는 조례 조항이 있는지 표로 정리해줘.")
+    payload = {"model": model, "temperature": 0.1,
+               "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
+    resp = requests.post(OPENAI_URL, headers={"Authorization": f"Bearer {api_key}",
+                                              "Content-Type": "application/json"}, json=payload, timeout=180)
+    if resp.status_code != 200:
+        raise RuntimeError(f"OpenAI API 오류 {resp.status_code}: {resp.text[:300]}")
+    return resp.json()["choices"][0]["message"]["content"].strip()
+
+
+def unverified_article_refs(text, known_numbers):
+    """AI 초안에 나온 '제N조(의M)' 중 원문(조례·현행법 조문 목록)에 없는 번호를 돌려준다.
+    이런 번호는 자동 반영하지 않고 '확인 필요'로 표시한다."""
+    refs = set(re.findall(r"제(\d+조(?:의\d+)?)", text or ""))
+    return sorted(r for r in refs if r not in known_numbers)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -419,7 +466,7 @@ def _ftext(elem, *tags):
 LINK_GROUND = "근거(제1조 위임)"   # 가장 강한 연결: 그 법의 위임으로 제정된 조례
 LINK_CITE = "인용(본문)"           # 본문 조문에서 그 법을 인용
 LINK_WEAK = "관련(간접)"           # 본문 검증했으나 「법률명」 직접 인용은 없음(검색만 매칭)
-LINK_NONE = "미검증"               # 본문을 확인하지 않음
+LINK_NONE = "확인 필요(미검증)"     # 본문을 확인하지 않음 — 사람이 볼 목록으로 따로 표시
 
 
 def collect_law_terms(name, prev_name, alias, extra_text=""):
@@ -437,25 +484,45 @@ def collect_law_terms(name, prev_name, alias, extra_text=""):
     return terms
 
 
+_JO_RE = re.compile(r"\s*(제\d+조(?:의\d+)?)")
+
+
+def find_citations(articles, law_terms):
+    """모든 조문에서 모든 명칭 인용을 찾는다(누락 방지).
+    반환: [{"jo", "term", "snippet", "purpose"}] — purpose=제1조(목적) 인용 여부.
+    긴 명칭부터 찾고, 이미 잡힌 위치와 겹치는 짧은 명칭은 중복으로 세지 않는다."""
+    terms = sorted({t for t in law_terms if t}, key=len, reverse=True)
+    found = []
+    for title, content in articles:
+        m = _JO_RE.match(content or "")
+        jo = m.group(1) if m else (title or "본문")
+        # '제1조의2'는 목적조항이 아니다 — 조번호가 정확히 제1조일 때만(또는 제목이 '목적')
+        purpose = jo == "제1조" or (title or "").strip() == "목적"
+        spans = []
+        for t in terms:
+            for mm in re.finditer(re.escape(t), content or ""):
+                s, e = mm.span()
+                if any(s < e2 and s2 < e for s2, e2 in spans):
+                    continue
+                spans.append((s, e))
+                found.append({"jo": jo, "term": t, "snippet": _snippet(content, t), "purpose": purpose})
+    return found
+
+
 def analyze_link(articles, law_terms):
-    """본문 조문에서 law_terms(현행명·이전명·약칭 등) 중 하나의 인용을 찾아
+    """본문 조문에서 law_terms(현행명·이전명·약칭 등) 인용을 찾아
     (연결강도, 인용조문, 인용문장요약, 인용된_명칭) 반환.
-    law_terms[0]=현행명이 우선이므로, 현행명이 있으면 현행으로 잡힌다."""
-    # 제1조(목적) 우선 확인 -------------------------------------------
-    for title, content in articles:
-        is_first = content.startswith("제1조") or ("목적" in (title or ""))
-        if is_first:
-            for t in law_terms:
-                if t and t in content:
-                    return LINK_GROUND, "제1조(목적)", _snippet(content, t), t
-    # 그 밖의 조문에서 인용 -------------------------------------------
-    for title, content in articles:
-        for t in law_terms:
-            if t and t in content:
-                m = re.match(r"(제\d+조(?:의\d+)?)", content)
-                jo = m.group(1) if m else (title or "본문")
-                return LINK_CITE, jo, _snippet(content, t), t
-    return LINK_WEAK, "-", "", ""
+    한 조례에 현행명과 옛 명칭이 섞여 있으면 옛 명칭 인용을 우선 표시한다(정비 대상 누락 방지)."""
+    cites = find_citations(articles, law_terms)
+    if not cites:
+        return LINK_WEAK, "-", "", ""
+    ground = [c for c in cites if c["purpose"]]
+    strength = LINK_GROUND if ground else LINK_CITE
+    current = law_terms[0] if law_terms else ""
+    old = [c for c in cites if c["term"] != current]
+    pick = old[0] if old else (ground or cites)[0]
+    jo = "제1조(목적)" if pick["purpose"] else pick["jo"]
+    return strength, jo, pick["snippet"], pick["term"]
 
 
 def _snippet(text, keyword, span=35):
@@ -521,6 +588,9 @@ class App(tk.Tk):
         self.var_sigungu = tk.StringVar(value=SIGUNGU_ALL)
         self.cmb_sigungu = ttk.Combobox(top, textvariable=self.var_sigungu, width=12)  # 편집 가능
         self.cmb_sigungu.grid(row=0, column=5, padx=(4, 0), pady=(10, 4), sticky="w")
+        ttk.Label(top, text="소관부서").grid(row=0, column=6, padx=(18, 4), pady=(10, 4), sticky="e")
+        self.var_dept = tk.StringVar()   # 부서 서무 주임(왕서무)이 '우리 부서 조례'만 보도록
+        ttk.Entry(top, textvariable=self.var_dept, width=16).grid(row=0, column=7, pady=(10, 4), sticky="w")
 
         # row 1 — API 인증키 / 추가 검색어(옛 이름·약칭)
         ttk.Label(top, text="API 인증키(OC)").grid(row=1, column=0, padx=(10, 4), pady=4, sticky="e")
@@ -536,11 +606,11 @@ class App(tk.Tk):
             value="ⓘ [🔎 법령 확인]으로 정식명칭을 고르면 옛 이름(제명변경 전)도 자동으로 함께 검색합니다. "
                   "‘추가 검색어’ 칸에 옛 이름·약칭을 직접(쉼표 구분) 넣어도 됩니다.")
         ttk.Label(top, textvariable=self.var_lawinfo, foreground="#1565c0").grid(
-            row=2, column=0, columnspan=6, sticky="w", padx=(12, 0), pady=(0, 2))
+            row=2, column=0, columnspan=8, sticky="w", padx=(12, 0), pady=(0, 2))
 
         # row 3 — 옵션 + 실행 버튼
         opt = ttk.Frame(top)
-        opt.grid(row=3, column=0, columnspan=6, sticky="we", padx=10, pady=(2, 8))
+        opt.grid(row=3, column=0, columnspan=8, sticky="we", padx=10, pady=(2, 8))
         self.var_verify = tk.BooleanVar(value=True)
         ttk.Checkbutton(opt, text="본문 검증(제1조 인용 확인 · 권장)", variable=self.var_verify).pack(side="left")
         self.var_ord_only = tk.BooleanVar(value=False)
@@ -557,7 +627,7 @@ class App(tk.Tk):
         self.btn_run = ttk.Button(opt, text="🔍  연결 조회", style="Accent.TButton", command=self.on_search)
         self.btn_run.pack(side="right")
 
-        for c in range(6):
+        for c in range(8):
             top.columnconfigure(c, weight=0)
 
         # ── 본문: 좌(표) / 우(그래프) ────────────────────────────────
@@ -566,10 +636,10 @@ class App(tk.Tk):
 
         left = ttk.Frame(body)
         body.add(left, weight=3)
-        cols = ("name", "gov", "kind", "link", "cited", "jo", "enforce")
-        heads = {"name": "자치법규명", "gov": "지자체", "kind": "종류",
+        cols = ("name", "gov", "dept", "kind", "link", "cited", "jo", "enforce")
+        heads = {"name": "자치법규명", "gov": "지자체", "dept": "소관부서", "kind": "종류",
                  "link": "연결강도", "cited": "인용명칭", "jo": "인용조문", "enforce": "시행일"}
-        widths = {"name": 268, "gov": 124, "kind": 52, "link": 116, "cited": 140, "jo": 78, "enforce": 80}
+        widths = {"name": 250, "gov": 110, "dept": 100, "kind": 52, "link": 116, "cited": 140, "jo": 78, "enforce": 80}
         self.tree = ttk.Treeview(left, columns=cols, show="headings", selectmode="browse")
         for c in cols:
             self.tree.heading(c, text=heads[c], command=lambda cc=c: self._sort_by(cc))
@@ -604,6 +674,11 @@ class App(tk.Tk):
         self.btn_csv.pack(side="left")
         self.btn_amend = ttk.Button(bottom, text="✏️ 개정안 제안", command=self.on_amendment, state="disabled")
         self.btn_amend.pack(side="left", padx=(6, 0))
+        self.btn_gap = ttk.Button(bottom, text="🧩 빠진 조문 점검(AI)", command=self.on_gap, state="disabled")
+        self.btn_gap.pack(side="left", padx=(6, 0))
+        self.btn_reg = ttk.Button(bottom, text="📋 검토카드 등록", command=self.on_register, state="disabled")
+        self.btn_reg.pack(side="left", padx=(6, 0))
+        ttk.Button(bottom, text="📋 검토카드 열기", command=self.on_open_review).pack(side="left", padx=(6, 0))
 
         self.on_sido_change()  # 초기 시군구 목록 채우기
 
@@ -731,6 +806,8 @@ class App(tk.Tk):
         self.btn_run.config(state="disabled")
         self.btn_csv.config(state="disabled")
         self.btn_amend.config(state="disabled")
+        self.btn_gap.config(state="disabled")
+        self.btn_reg.config(state="disabled")
         self.tree.delete(*self.tree.get_children())
         self.rows = []
         self.progress.config(value=0)
@@ -741,6 +818,7 @@ class App(tk.Tk):
             "max": int(self.var_max.get()),
             "ord_only": self.var_ord_only.get(),
             "extra": self.var_extra.get().strip(),
+            "dept": self.var_dept.get().strip(),
         }
         threading.Thread(target=self._worker, args=(law, sido, org, sigungu, opts), daemon=True).start()
 
@@ -806,19 +884,27 @@ class App(tk.Tk):
 
             # 3) 본문 검증(CoVe) — 어떤 명칭(현행/구명)으로 인용했는지까지 -----
             verify = opts["verify"]
-            vmax = opts["vmax"]
+            vmax = len(items) if opts.get("dept") else opts["vmax"]
             for idx, it in enumerate(items):
                 if verify and idx < vmax:
                     self._ui(lambda i=idx: self._set_progress(i + 1, min(len(items), vmax),
                                                               f"본문 검증 {i + 1}/{min(len(items), vmax)}"))
                     try:
-                        _, arts = self.api.get_ordinance_articles(it["mst"])
+                        meta, arts = self.api.get_ordinance_articles(it["mst"])
+                        it["dept"] = meta.get("dept", "")          # 법제처 자치법규 기본정보의 담당부서
                         strength, jo, snip, cited = analyze_link(arts, terms)
+                        it["cites"] = find_citations(arts, terms)   # 검토카드 등록용 전체 인용
                     except Exception:
                         strength, jo, snip, cited = LINK_NONE, "-", "", ""
                     it["link"], it["jo"], it["snippet"], it["cited"] = strength, jo, snip, cited
                 else:
                     it["link"], it["jo"], it["snippet"], it["cited"] = LINK_NONE, "-", "", ""
+
+            if opts.get("dept"):
+                items = [x for x in items if opts["dept"] in (x.get("dept") or "")]
+                if not items:
+                    self._ui(lambda: self._finish_empty(law_name, sido, sigungu, total_cur))
+                    return
 
             # 연결강도 순 정렬 (근거 > 인용 > 관련 > 미검증), 그 안에서 지자체명
             order = {LINK_GROUND: 0, LINK_CITE: 1, LINK_WEAK: 2, LINK_NONE: 3}
@@ -848,7 +934,7 @@ class App(tk.Tk):
 
     def _insert_row(self, it, tagmap):
         self.tree.insert("", "end", values=(
-            it["name"], it["gov"], it["kind"], it["link"], self._cited_disp(it),
+            it["name"], it["gov"], it.get("dept", ""), it["kind"], it["link"], self._cited_disp(it),
             it["jo"], it["enforce"]),
             tags=(tagmap.get(it["link"], "none"),))
 
@@ -873,6 +959,8 @@ class App(tk.Tk):
         self.btn_run.config(state="normal")
         self.btn_csv.config(state="normal")
         self.btn_amend.config(state="normal")
+        self.btn_gap.config(state="normal")
+        self.btn_reg.config(state="normal")
         self._draw_network(law_name)
 
     def _finish_empty(self, law_name, sido, sigungu, total):
@@ -978,7 +1066,7 @@ class App(tk.Tk):
     def _sort_by(self, col):
         if not self.rows:
             return
-        keymap = {"name": "name", "gov": "gov", "kind": "kind",
+        keymap = {"name": "name", "gov": "gov", "dept": "dept", "kind": "kind",
                   "link": "link", "cited": "cited", "jo": "jo", "enforce": "enforce"}
         k = keymap.get(col, "gov")
         rev = getattr(self, "_sort_rev_" + col, False)
@@ -1000,10 +1088,10 @@ class App(tk.Tk):
             return
         with open(path, "w", encoding="utf-8-sig", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["자치법규명", "지자체", "종류", "연결강도", "인용명칭", "인용조문",
+            w.writerow(["자치법규명", "지자체", "소관부서", "종류", "연결강도", "인용명칭", "인용조문",
                         "인용문장", "시행일", "공포일", "제개정", "MST"])
             for it in self.rows:
-                w.writerow([it["name"], it["gov"], it["kind"], it["link"],
+                w.writerow([it["name"], it["gov"], it.get("dept", ""), it["kind"], it["link"],
                             it.get("cited", ""), it["jo"],
                             it.get("snippet", ""), it["enforce"], it["promulgation"],
                             it["revision"], it["mst"]])
@@ -1060,7 +1148,10 @@ class App(tk.Tk):
                     law_arts = None
                 result = generate_amendment(DEFAULT_OPENAI, it["name"], it["gov"],
                                             old_name, new_name, hit, law_articles=law_arts)
-                self._ui(lambda: self._show_amendment(it, old_name, new_name, result))
+                known = {m.group(1)[1:] for _, c in arts for m in [_JO_RE.match(c)] if m}
+                known |= {f"{a['no']}조" for a in (law_arts or []) if a.get("no")}
+                unknown = unverified_article_refs(result, known)
+                self._ui(lambda: self._show_amendment(it, old_name, new_name, result, unknown))
             except Exception as e:
                 msg = str(e)
                 self._ui(lambda m=msg: (self.var_status.set("개정안 생성 실패"),
@@ -1068,7 +1159,7 @@ class App(tk.Tk):
                                         messagebox.showerror("오류", "개정안 생성 실패:\n" + m)))
         threading.Thread(target=work, daemon=True).start()
 
-    def _show_amendment(self, it, old_name, new_name, text):
+    def _show_amendment(self, it, old_name, new_name, text, unknown=()):
         self.var_status.set(f"‘{it['name']}’ 개정안 생성 완료")
         self.btn_amend.config(state="normal")
         dlg = tk.Toplevel(self)
@@ -1079,6 +1170,9 @@ class App(tk.Tk):
                   font=("Malgun Gothic", 12, "bold")).pack(anchor="w", padx=12, pady=(10, 2))
         ttk.Label(dlg, text=f"명칭 정비:  「{old_name}」  →  「{new_name}」",
                   foreground="#c62828").pack(anchor="w", padx=12, pady=(0, 8))
+        if unknown:
+            ttk.Label(dlg, text="⚠ 확인 필요 — 원문에 없는 조문번호: " + ", ".join("제" + u for u in unknown),
+                      foreground="#b71c1c").pack(anchor="w", padx=12, pady=(0, 6))
         frm = ttk.Frame(dlg)
         frm.pack(fill="both", expand=True, padx=12)
         txt = tk.Text(frm, wrap="word", font=("Malgun Gothic", 10))
@@ -1108,6 +1202,79 @@ class App(tk.Tk):
         ttk.Button(bf, text="저장(.md)", command=save).pack(side="right", padx=(8, 0))
         ttk.Button(bf, text="닫기", command=dlg.destroy).pack(side="right")
 
+    # 빠진 조문 점검 (생성형 AI) — 법의 의무 조항 ↔ 조례 대조 ----------------
+    def on_gap(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("빠진 조문 점검", "표에서 조례를 한 건 선택하세요.")
+            return
+        it = self.rows[self.tree.index(sel[0])]
+        mst_law = (self.law_info or {}).get("mst")
+        if not mst_law:
+            messagebox.showinfo("빠진 조문 점검", "법령 정보를 확인하지 못했습니다. [🔎 법령 확인] 후 다시 조회하세요.")
+            return
+        if not DEFAULT_OPENAI:
+            messagebox.showwarning("OpenAI 키 필요", "빠진 조문 점검에는 OpenAI API 키가 필요합니다.\n"
+                                   ".env 파일에 OPENAI_API_KEY 를 설정하세요(.env.example 참고).")
+            return
+        self.btn_gap.config(state="disabled")
+        self.var_status.set(f"‘{it['name']}’ 빠진 조문 점검 중… (법 의무 조항 ↔ 조례 대조)")
+
+        def work():
+            try:
+                law_arts = self.api.get_law_articles(mst_law)
+                obl = obligation_articles(law_arts)
+                if not obl:
+                    self._ui(lambda: (self.btn_gap.config(state="normal"),
+                                      self.var_status.set("빠진 조문 점검: 지자체 의무 조항 없음"),
+                                      messagebox.showinfo("빠진 조문 점검",
+                                                          "이 법에서 지방자치단체에 ‘하여야 한다’고 정한 조항을 찾지 못했습니다.")))
+                    return
+                _, arts = self.api.get_ordinance_articles(it["mst"])
+                result = find_gaps(DEFAULT_OPENAI, self.current_name, obl, it["name"], it["gov"], arts)
+                known = {m.group(1)[1:] for _, c in arts for m in [_JO_RE.match(c)] if m}
+                known |= {f"{a['no']}조" for a in law_arts if a.get("no")}
+                unknown = unverified_article_refs(result, known)
+                head = f"「{self.current_name}」 의무 조항 {len(obl)}개 ↔ {it['name']}"
+                self._ui(lambda: self._show_ai_result(f"빠진 조문 점검 — {it['name']}", head, result, unknown,
+                                                      f"빠진조문점검_{it['gov']}_{it['name']}.md"))
+            except Exception as e:
+                msg = str(e)
+                self._ui(lambda m=msg: (self.var_status.set("빠진 조문 점검 실패"),
+                                        messagebox.showerror("오류", "빠진 조문 점검 실패:\n" + m)))
+            finally:
+                self._ui(lambda: self.btn_gap.config(state="normal"))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_ai_result(self, title, head, text, unknown, save_name):
+        self.var_status.set(title + " 완료")
+        dlg = tk.Toplevel(self)
+        dlg.title(title)
+        dlg.geometry("900x620")
+        dlg.transient(self)
+        ttk.Label(dlg, text=head, font=("Malgun Gothic", 11, "bold")).pack(anchor="w", padx=12, pady=(10, 4))
+        if unknown:
+            ttk.Label(dlg, text="⚠ 확인 필요 — 원문에 없는 조문번호: " + ", ".join("제" + u for u in unknown),
+                      foreground="#b71c1c").pack(anchor="w", padx=12, pady=(0, 6))
+        txt = tk.Text(dlg, wrap="word", font=("Malgun Gothic", 10))
+        txt.pack(fill="both", expand=True, padx=12)
+        txt.insert("1.0", text)
+        txt.configure(state="disabled")
+        bf = ttk.Frame(dlg)
+        bf.pack(fill="x", pady=8, padx=12)
+        ttk.Label(bf, text="⚠ AI 초안입니다. 개정 여부는 소관부서·법무담당관이 원문으로 확인 후 판단하세요.",
+                  foreground="#8a3b00").pack(side="left")
+
+        def save():
+            p = filedialog.asksaveasfilename(defaultextension=".md", initialfile=save_name.replace(" ", "_"),
+                                             filetypes=[("Markdown", "*.md"), ("텍스트", "*.txt")])
+            if p:
+                with open(p, "w", encoding="utf-8") as f:
+                    f.write(f"# {title}\n\n- {head}\n\n{text}\n")
+                messagebox.showinfo("저장 완료", f"저장했습니다.\n{p}")
+        ttk.Button(bf, text="저장(.md)", command=save).pack(side="right", padx=(8, 0))
+        ttk.Button(bf, text="닫기", command=dlg.destroy).pack(side="right")
+
     # 도움말 -------------------------------------------------------------
     def show_help(self):
         msg = (
@@ -1128,6 +1295,10 @@ class App(tk.Tk):
             "  · 법률명은 정식 명칭으로 (예: 주차장법, 옥외광고물 등의 관리와 옥외광고산업 진흥에 관한 법률)\n"
             "  · 지자체는 ‘서울특별시’처럼 광역명, 또는 ‘서울특별시 강남구’/‘경기도 수원시’처럼 시군구까지\n"
             "  · 행을 더블클릭하면 국가법령정보센터 원문이 열립니다.\n\n"
+            "■ 부서 서무 주임(왕서무)용\n"
+            "  · ‘소관부서’ 칸에 부서명(예: 자원순환과)을 넣으면 우리 부서 조례만 보여 줍니다(전부 본문 확인).\n"
+            "  · [📋 검토카드 등록] 시 소관부서가 담당부서로 미리 채워집니다.\n"
+            "  · [🧩 빠진 조문 점검(AI)]: 법이 지자체에 ‘하여야 한다’고 정한 조항과 조례를 AI가 대조합니다.\n\n"
             "■ 검증(CoVe)\n"
             "  검색 결과를 그대로 믿지 않고 조례 본문 원문을 다시 대조합니다.\n"
             "  건수가 많으면 ‘검증 상위 N건’만 본문을 확인하고 나머지는 ‘단순매칭’으로 둡니다."
@@ -1146,6 +1317,30 @@ class App(tk.Tk):
             "※ 인증키는 신청·승인으로 부여되는 값이라 임의로 만들 수 없습니다.\n"
             "확인을 누르면 신청 페이지를 엽니다.")
         webbrowser.open("https://open.law.go.kr/LSO/openApi/cuAskList.do")
+
+    # 검토카드 -----------------------------------------------------------
+    def _store(self):
+        if getattr(self, "store", None) is None:
+            self.store = ReviewStore(os.path.join(os.path.dirname(os.path.abspath(__file__)), "radar.db"))
+        return self.store
+
+    def on_register(self):
+        recs = records_from_rows(self.rows, self.current_name, self.law_info, self.current_name)
+        n_unverified = sum(1 for x in self.rows if x["link"] == LINK_NONE)
+        if not recs:
+            messagebox.showinfo("검토카드", "본문으로 확인된 인용이 없어 등록할 사건이 없습니다.")
+            return
+        cnt = self._store().register(recs, "API", law_name=self.current_name,
+                                     scope=self.var_sido.get() + " " + self.var_sigungu.get(),
+                                     n_failed=n_unverified)
+        messagebox.showinfo("검토카드 등록",
+                            f"인용 {len(recs)}건 → 신규 사건 {cnt['new']} · 이미 등록 {cnt['dup']} · "
+                            f"법령 버전 변경 재검토 {cnt['relinked']}\n"
+                            f"(본문 미검증 {n_unverified}건은 등록하지 않았습니다 — ‘검증 상위 N건’을 늘려 다시 조회하세요)")
+        self.on_open_review()
+
+    def on_open_review(self):
+        ReviewWindow(self, self._store(), self.current_name)
 
     # 스레드 → UI 안전 호출 / 진행률 ------------------------------------
     def _ui(self, fn):
