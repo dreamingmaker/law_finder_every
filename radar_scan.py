@@ -21,7 +21,6 @@ import csv
 import hashlib
 import json
 import os
-import re
 import sys
 import time
 from collections import Counter, defaultdict
@@ -97,7 +96,7 @@ def scan_law(api, law, org, max_count=1000, log=print):
             short[t] = min(total, max_count) - len(got)
         for mst, it in got.items():
             merged.setdefault(mst, it)
-    log(f"  검색: " + ", ".join(f"{t} {n}건" for t, n in hits_by_term.items()) + f" → 자치법규 {len(merged)}건")
+    log("  검색: " + ", ".join(f"{t} {n}건" for t, n in hits_by_term.items()) + f" → 자치법규 {len(merged)}건")
 
     try:   # 유형② 조문 인용 점검용 현행 조문 목록(법령당 1회 조회)
         law_arts = api.get_law_articles(law["mst"]) if law.get("mst") else []
@@ -264,8 +263,7 @@ def main(argv=None):
         r = v["rec"]
         refs = [x for x in all_refs if x["ord_mst"] == mst and x["ord_jo"] == jo and x["law_name"] == law_name]
         new, basis, checks = R.auto_type2_draft(r["article_text"], law_name, sorted(v["cited"]), refs)
-        name = r["ord_name"] if r["ord_name"].startswith(r["gov"]) else f"{r['gov']}_{r['ord_name']}"   # 기관명 중복 방지
-        base = re.sub(r"[\\/:*?\"<>|\s]+", "_", f"{name}_{jo}")[:120]
+        base = R.safe_filename(r["gov"], r["ord_name"], jo)
         srcn = f"현행 조문 출처: 법제처 국가법령정보 공동활용, 조회 {started:%Y-%m-%d %H:%M}, 자치법규 MST {mst}"
         R.export_comparison(os.path.join(ddir, f"신구조문대비표_초안_{base}.html"), r["ord_name"], [(r["article_text"], new)], srcn)
         reason = (f"상위법 명칭 변경(「{'」·「'.join(sorted(v['cited']))}」 → 「{law_name}」)에 따른 인용 정비" if v["cited"]

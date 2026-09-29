@@ -75,7 +75,7 @@ class CitationTests(unittest.TestCase):
         arts = [{"no": "14", "title": "공공지능정보화", "content": "제14조 국가기관등은 … 공공지능정보화를 추진하여야 한다."},
                 {"no": "15", "title": "지역지능정보화", "content": "제15조 지방자치단체는 … 추진할 수 있다."},
                 {"no": "6", "title": "기본계획", "content": "제6조 정부는 기본계획을 수립하여야 한다."}]
-        self.assertEqual([a["no"] for a in lon.obligation_articles(arts)], ["14"])
+        self.assertEqual([a["no"] for a in ai_review.obligation_articles(arts)], ["14"])
 
 
 class ScanTests(unittest.TestCase):
@@ -230,7 +230,6 @@ if __name__ == "__main__":
 
 
 # ── 유형② 조문 인용 점검 · 대비표 초안 · 유형①③ 보조 · DB v2 ─────────────────────
-import json  # noqa: E402
 import sqlite3  # noqa: E402
 
 import re  # noqa: E402
@@ -294,6 +293,10 @@ class RevisionTests(unittest.TestCase):
         memo = R.build_memo("유형②", "시험 조례", "서울특별시", "자원순환과", NEW, ["근거"], "사유", ["확인"], "출처")
         for k in ("정비 유형", "근거 법령", "개정 사유", "추가 확인 사항", "출처·기준일", R.DRAFT_MARK):
             self.assertIn(k, memo)
+
+    def test_safe_filename(self):
+        self.assertEqual(R.safe_filename("서울특별시 마포구", "서울특별시 마포구 자살예방 조례", "제8조"), "서울특별시_마포구_자살예방_조례_제8조")
+        self.assertEqual(R.safe_filename("서울특별시", "A/B:조례?", "신설(제20조)"), "서울특별시_A_B_조례_신설(제20조)")
 
     def test_followup_checks_for_new_article(self):
         self.assertTrue(any("신설" in c for c in R.followup_checks("<신 설>", "제9조의2(공공지능정보화) …")))

@@ -155,7 +155,7 @@ class DraftWindow(tk.Toplevel):
         d = filedialog.askdirectory(parent=self, title="대비표·메모를 저장할 폴더")
         if not d:
             return
-        base = f"{self.ev['gov']}_{self.ev['ord_name']}_{self.ev['jo']}".replace(" ", "_")
+        base = R.safe_filename(self.ev["gov"], self.ev["ord_name"], self.ev["jo"])
         src = f"현행 조문 출처: 법제처 국가법령정보 공동활용(조회 {self.ev['fetched_at']})"
         p1 = R.export_comparison(os.path.join(d, f"신구조문대비표_초안_{base}.html"), self.ev["ord_name"], [(cur, new)], src)
         p2 = os.path.join(d, f"검토메모_{base}.txt")

@@ -38,7 +38,6 @@ from urllib.parse import urlencode
 import requests
 
 from review_store import ReviewStore, records_from_rows
-from ai_review import obligation_articles  # noqa: F401  (유형① 후보 선별 규칙 — 시험·외부 사용)
 from revision import law_article_label
 
 import tkinter as tk

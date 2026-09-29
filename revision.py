@@ -141,6 +141,12 @@ def followup_checks(old_text, new_text):
     return notes
 
 
+def safe_filename(gov, ord_name, jo, limit=120):
+    """대비표·메모 파일 이름: 조례명에 이미 들어 있는 기관명은 한 번만, Windows에서 못 쓰는 문자는 _ 로."""
+    name = ord_name if (ord_name or "").startswith(gov or "") else f"{gov}_{ord_name}"
+    return re.sub(r'[\\/:*?"<>|\s_]+', "_", f"{name}_{jo}").strip("_")[:limit]
+
+
 def _marked_html(segs):
     return "".join(f"<u><b>{html.escape(t)}</b></u>" if ch else html.escape(t) for t, ch in segs).replace("\n", "<br>")
 
