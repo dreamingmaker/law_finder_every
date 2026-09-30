@@ -66,15 +66,15 @@ def _words(text):
     return {w for w in re.findall(r"[가-힣]{2,}", text or "") if w not in ("따라", "경우", "필요한", "사항", "이하", "한다")}
 
 
-def check_refs(refs, law_articles, current_name):
-    """조문 인용을 현행 법령 조문 목록과 대조한다.
+def check_refs(refs, law_articles, current_name, current_aliases=()):
+    """조문 인용을 현행 법령 조문 목록과 대조한다. current_aliases: 현행 약칭(옛 법령명으로 보지 않음).
     status: '현행 조문 있음' / '현행 조문 있음(옛 법령명 — 내용 대조 필요)' / '현행 법에 없음(삭제·이동 의심)'
     candidate: 이동 이력이 있거나 제목·내용 단어가 가장 많이 겹치는 현행 조문(참고용, 확정 아님)."""
     by_key = {a.get("key") or a.get("no"): a for a in law_articles}
     out = []
     for r in refs:
         a = by_key.get(r["key"])
-        old = r["term"] != current_name
+        old = r["term"] not in {current_name, *current_aliases}
         res = dict(r)
         res["label"] = "제" + law_article_label({"key": r["key"]})
         if a:
@@ -198,3 +198,56 @@ def auto_type2_draft(article_text, current_name, cited_names, ref_results):
         elif "없음" in r["status"]:
             checks.append(f"{r['text']}: 대체 근거 불명확 — 다른 법률로 이관 여부 등 추가 확인 필요(자동 삭제하지 않음)")
     return new, basis, checks
+
+
+# ── 유형④ 용어·표현 정비 ────────────────────────────────────────────────
+# 법령 개정으로 바뀐 용어가 조례 본문에 남아 있는지 찾는다(「」 안의 법령명은 유형②가 담당하므로 제외).
+# 같은 문장이 권리·의무(지원·감면·부과 등)와 관련되면 단순 용어 정리가 아니므로 ‘별도 검토’로 표시한다.
+RIGHTS_RE = re.compile(r"지원|감면|면제|부과|징수|과태료|벌칙|자격|의무|금지|허가|인가|신고|보조|수수료|사용료|요금|지급|제한")
+
+
+def load_terms(path):
+    """용어 목록 파일: 한 줄에 ‘옛 용어 => 새 용어 | 근거·비고 | 제외: 단어1, 단어2’ (# 주석).
+    ‘제외’에 적은 단어의 일부로 나온 경우(예: 문화재 ← 서울문화재단)는 찾지 않는다."""
+    terms = []
+    with open(path, encoding="utf-8-sig") as f:
+        for ln in f:
+            ln = ln.strip()
+            if not ln or ln.startswith("#") or "=>" not in ln:
+                continue
+            old, rest = ln.split("=>", 1)
+            segs = [s.strip() for s in rest.split("|")]
+            new, note = segs[0], (segs[1] if len(segs) > 1 else "")
+            excl = [w.strip() for s in segs[2:] if s.startswith("제외") for w in s.split(":", 1)[-1].split(",") if w.strip()]
+            if old.strip() and new:
+                terms.append((old.strip(), new, note, excl))
+    return terms
+
+
+def find_term_issues(articles, terms):
+    """조문별 옛 용어 사용 위치 → [{ord_jo, old, new, note, sentence, rights}] (「」 안 제외)."""
+    out = []
+    for title, content in articles:
+        jm = re.match(r"\s*(제\d+조(?:의\d+)?)", content or "")
+        ord_jo = jm.group(1) if jm else (title or "본문")
+        masked = re.sub(r"「[^」]*」", lambda m: " " * len(m.group(0)), content or "")
+        for term in terms:
+            old, new, note = term[:3]
+            excl = term[3] if len(term) > 3 else []
+            for m in re.finditer(re.escape(old), masked):
+                if any(e.start() <= m.start() and m.end() <= e.end()
+                       for x in excl for e in re.finditer(re.escape(x), masked)):
+                    continue   # 제외 단어의 일부(예: 서울문화재단의 ‘문화재’)
+                s0 = content.rfind(".", 0, m.start()) + 1
+                s1 = content.find(".", m.end())
+                sent = content[s0: s1 + 1 if s1 >= 0 else None].strip()
+                out.append({"ord_jo": ord_jo, "old": old, "new": new, "note": note, "sentence": sent,
+                            "rights": bool(RIGHTS_RE.search(sent)), "pos": m.start()})
+                break   # 조문마다 용어별 첫 위치만(치환은 담당자가 선택한 범위에서)
+    return out
+
+
+def replace_term_outside_brackets(text, old, new):
+    """「」 안(법령명)은 건드리지 않고 본문 용어만 바꾼다."""
+    parts = re.split(r"(「[^」]*」)", text)
+    return "".join(p if p.startswith("「") else p.replace(old, new) for p in parts)

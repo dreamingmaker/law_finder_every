@@ -166,7 +166,7 @@ class ReviewStore:
             "ELSE 0 END, (due='' OR due IS NULL), due, gov, ord_name").fetchall()
 
     def save_draft(self, event_id, kind, current_text, draft_text, memo):
-        """신구조문대비표 초안 저장(담당자 수정본). 후임자가 이어서 볼 수 있게 DB에 남긴다."""
+        """신구조문대비표 초안 저장(담당자 수정본)."""
         self.db.execute("INSERT OR REPLACE INTO draft(event_id,kind,current_text,draft_text,memo,updated_at) "
                         "VALUES(?,?,?,?,?,?)", (event_id, kind, current_text, draft_text, memo, _now()))
         self._hist(event_id, "draft", "", kind, "대비표 초안 저장")

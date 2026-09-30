@@ -388,3 +388,66 @@ class BlindSpotScanTests(unittest.TestCase):
         html_ = _read(os.path.join(dd, [f for f in files if f.endswith(".html")][0]))
         self.assertIn(CUR, re.sub(r"<[^>]+>", "", html_))      # 개정안에 현행 법령명
         self.assertIn(f"<u><b>「{CUR}」</b></u>", html_)  # 바뀐 법령명 전체 밑줄
+
+
+class Type4AndAliasTests(unittest.TestCase):
+    TERMS = [("정신보건센터", "정신건강복지센터", "정신건강복지법 용어"), ("문화재", "국가유산(또는 문화유산)", "문맥 확인")]
+
+    def test_official_short_name_is_not_old_name(self):
+        refs = R.find_law_refs([("", "제2조 「문화유산법」 제2조에 따른 문화유산")], ["문화유산의 보존 및 활용에 관한 법률", "문화유산법"])
+        res = R.check_refs(refs, [{"no": "2", "key": "2", "title": "정의"}], "문화유산의 보존 및 활용에 관한 법률", ["문화유산법"])
+        self.assertEqual(res[0]["status"], "현행 조문 있음")
+
+    def test_term_found_outside_brackets_only(self):
+        arts = [("", "제8조 ② 자살예방센터를「정신보건법」제13조의2에 따른 정신보건센터에 둘 수 있다."),
+                ("", "제3조 「문화재보호법」에 따라 등록된 시설")]
+        got = R.find_term_issues(arts, self.TERMS)
+        self.assertEqual([(g["ord_jo"], g["old"]) for g in got], [("제8조", "정신보건센터")])   # 「문화재보호법」 속 ‘문화재’는 제외
+
+    def test_rights_related_sentence_is_flagged(self):
+        got = R.find_term_issues([("", "제3조(감면) 문화재에 대하여는 사용료를 감면한다.")], self.TERMS)
+        self.assertTrue(got[0]["rights"])
+
+    def test_replace_term_keeps_law_names(self):
+        s = "「문화재보호법」에 따른 문화재"
+        self.assertEqual(R.replace_term_outside_brackets(s, "문화재", "국가유산"), "「문화재보호법」에 따른 국가유산")
+
+    def test_term_list_file_loads(self):
+        terms = R.load_terms(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "용어정비_목록.txt"))
+        self.assertIn(("재래시장", "전통시장"), [(t[0], t[1]) for t in terms])
+
+    def test_scan_writes_term_csv(self):
+        class API(FakeAPI):
+            def get_ordinance_articles(self, mst):
+                return {"dept": "보건과"}, [("설치", f"제8조 「{OLD}」에 따른 정신보건센터에 둔다.")]
+
+            def search_law(self, n, display=5):
+                return [{"name": CUR, "law_id": "L1", "mst": "M1", "promulgation": "2024", "kind": "법률"}]
+
+            def get_law_meta(self, m):
+                return {"prev_name": OLD, "alias": ""}
+        import law_ordinance_network as lon2
+        orig, orig_terms = lon2.LawGoKrAPI, radar_scan.TERMS
+        lon2.LawGoKrAPI = lambda oc: API()
+        radar_scan.TERMS = self.TERMS
+        os.environ["LAW_OC"] = "x"
+        d = tempfile.mkdtemp(); lf = os.path.join(d, "l.txt")
+        with open(lf, "w", encoding="utf-8") as f:
+            f.write(CUR + "\n")
+        try:
+            res = radar_scan.main(["--laws", lf, "--out", os.path.join(d, "o"), "--db", os.path.join(d, "r.db")])
+        finally:
+            lon2.LawGoKrAPI, radar_scan.TERMS = orig, orig_terms
+        self.assertEqual(res["전체"]["용어정비_후보"], 2)          # 기관 2곳 × 제8조
+        self.assertIn("정신보건센터", _read(os.path.join(d, "o", "용어정비점검.csv")))
+
+
+class TermExclusionTests(unittest.TestCase):
+    def test_exclusion_word_is_skipped(self):
+        d = tempfile.mkdtemp(); p = os.path.join(d, "t.txt")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("문화재청 => 국가유산청 | 조직\n문화재 => 국가유산 | 체계 | 제외: 문화재단, 문화재청\n")
+        terms = R.load_terms(p)
+        self.assertEqual(terms[1][3], ["문화재단", "문화재청"])
+        got = R.find_term_issues([("", "제7조 위원은 서울문화재단 대표이사와 문화재청장, 지정 문화재 소유자로 한다.")], terms)
+        self.assertEqual(sorted(g["old"] for g in got), ["문화재", "문화재청"])   # 서울문화재단은 제외, ‘지정 문화재’만

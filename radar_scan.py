@@ -31,6 +31,10 @@ import revision as R
 from review_store import ReviewStore, csv_safe
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+try:
+    TERMS = R.load_terms(os.path.join(HERE, "용어정비_목록.txt"))   # 유형④ 용어 목록
+except OSError:
+    TERMS = []
 
 
 class CountingAPI:
@@ -103,6 +107,7 @@ def scan_law(api, law, org, max_count=1000, log=print):
     except Exception:
         law_arts = []
     records, failed, seen, ref_rows = [], [], set(), []
+    term_rows = []
     for i, it in enumerate(merged.values(), 1):
         try:
             meta, arts = api.get_ordinance_articles(it["mst"])
@@ -114,9 +119,11 @@ def scan_law(api, law, org, max_count=1000, log=print):
             continue
         dept = (meta or {}).get("dept", "")
         if law_arts:
-            for r in R.check_refs(R.find_law_refs(arts, terms), law_arts, law["name"]):
+            for r in R.check_refs(R.find_law_refs(arts, terms), law_arts, law["name"], [law["alias"]] if law["alias"] else []):
                 ref_rows.append({**r, "law_name": law["name"], "gov": it["gov"], "dept": dept, "ord_name": it["name"],
                                  "ord_id": it["ord_id"], "ord_mst": it["mst"]})
+        for t in R.find_term_issues(arts, TERMS):   # 유형④ 용어 정비 후보
+            term_rows.append({**t, "law_name": law["name"], "gov": it["gov"], "dept": dept, "ord_name": it["name"], "ord_mst": it["mst"]})
         for c in lon.find_citations(arts, terms):
             k = (it["ord_id"], c["jo"], c["term"])   # 같은 조문 안 반복 인용·같은 조례의 다른 버전은 1건
             if k in seen:
@@ -164,7 +171,9 @@ def scan_law(api, law, org, max_count=1000, log=print):
         "현행에_없는_조문_인용": sum(1 for r in ref_rows if "없음" in r["status"]),
         "옛이름_조문번호_대조필요": sum(1 for r in ref_rows if "내용 대조" in r["status"]),
         "현행조문목록_조회": bool(law_arts),
+        "용어정비_후보": len(term_rows), "용어정비_권리의무관련": sum(1 for t in term_rows if t["rights"]),
     }
+    summary["_term_rows"] = term_rows
     return records, failed, summary, ref_rows
 
 
@@ -195,7 +204,7 @@ def main(argv=None):
     store = ReviewStore(a.db)
     started = datetime.now()
     t0 = time.time()
-    all_rec, all_fail, per_law, all_refs = [], [], [], []
+    all_rec, all_fail, per_law, all_refs, all_terms = [], [], [], [], []
     for n, extra in names:
         print(f"■ {n}" + (f"  (+옛 이름 {', '.join(extra)})" if extra else ""))
         t1 = time.time()
@@ -214,6 +223,7 @@ def main(argv=None):
             print("  이전 법령명 없음(제명변경 이력 없음) — 현행명·약칭만 점검")
         rec, fail, s, refs = scan_law(api, law, org, a.max)
         all_refs += refs
+        all_terms += s.pop("_term_rows", [])
         cnt = store.register(rec, "API", law_name=law["name"], scope=sido, n_failed=len(fail),
                              capped=s["수집_상한_도달"])
         s["검토카드_등록"] = cnt
@@ -245,6 +255,19 @@ def main(argv=None):
             c = r.get("candidate")
             w.writerow([csv_safe(x) for x in (r["law_name"], r["gov"], r["dept"], r["ord_name"], r["ord_jo"], r["text"], r["status"],
                                              r.get("current_title", ""), f"{c['label']} {c['title']} ({c['why']})" if c else "")])
+
+    # 유형④ 용어 정비 후보(같은 조례·조문·용어는 1건)
+    seen_t, uniq_terms = set(), []
+    for t in all_terms:
+        k = (t["ord_mst"], t["ord_jo"], t["old"])
+        if k not in seen_t:
+            seen_t.add(k); uniq_terms.append(t)
+    with open(os.path.join(out, "용어정비점검.csv"), "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["지자체", "소관부서", "자치법규명", "조문", "옛 용어", "새 용어", "근거·비고", "권리·의무 관련", "문장"])
+        for t in uniq_terms:
+            w.writerow([csv_safe(x) for x in (t["gov"], t["dept"], t["ord_name"], t["ord_jo"], t["old"], t["new"], t["note"],
+                                             "예(별도 검토)" if t["rights"] else "", t["sentence"])])
 
     # 유형② 대비표 초안 자동 작성: 옛 법령명 인용 조문 + 현행 법에 없는 조문을 인용한 조문
     ddir = os.path.join(out, "대비표초안"); os.makedirs(ddir, exist_ok=True)
@@ -298,6 +321,7 @@ def main(argv=None):
         "타부서_인용_자치법규(법령별 합)": sum(s.get("타부서_인용_자치법규", 0) for s in per_law),
         "타부서_옛이름_인용_자치법규(법령별 합)": sum(s.get("타부서_옛이름_인용_자치법규", 0) for s in per_law),
         "조문인용_점검건수": len(all_refs), "현행에_없는_조문_인용": sum(1 for r in all_refs if "없음" in r["status"]),
+        "용어정비_후보": len(uniq_terms), "용어정비_권리의무관련": sum(1 for t in uniq_terms if t["rights"]),
         "대비표초안_작성건수": len(index), "대비표초안_타부서건수": sum(1 for x in index if x[3]), "대비표초안_생성초": draft_sec,
         "총_소요초": round(time.time() - t0, 1), "API_호출수": api.calls,
         "프로그램_sha256": hashlib.sha256(open(src, "rb").read()).hexdigest(),

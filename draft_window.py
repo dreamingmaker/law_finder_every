@@ -8,6 +8,8 @@ from tkinter import ttk, messagebox, filedialog
 
 import revision as R
 
+TERMS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "용어정비_목록.txt")
+
 
 class DraftWindow(tk.Toplevel):
     """preset(선택): 유형①·③ AI 결과를 채택했을 때 {kind, current_text, draft_text, basis, checks, reason}"""
@@ -15,7 +17,7 @@ class DraftWindow(tk.Toplevel):
     def __init__(self, master, store, event, api_factory=None, preset=None):
         super().__init__(master)
         self.store, self.ev, self.api_factory = store, event, api_factory
-        self.refs = []
+        self.items = []   # 표의 행 순서대로 ("ref", 인용점검) 또는 ("term", 용어정비)
         self.title(f"📝 신구조문대비표 초안 — {event['ord_name']} {event['jo']}  [{R.DRAFT_MARK}]")
         self.geometry("1180x780")
         saved = store.get_draft(event["id"])
@@ -33,6 +35,7 @@ class DraftWindow(tk.Toplevel):
         else:
             memo = self._memo(cur, basis, checks, reason, new)
         self._build(cur, new, memo)
+        self._show_terms(cur)
         if not event["article_text"] and not preset:
             self.var_note.set("⚠ 조문 전문이 저장되어 있지 않아 인용 문장만 표시합니다. 다시 조회·등록하면 전문이 채워집니다.")
         if api_factory and not preset:
@@ -54,13 +57,13 @@ class DraftWindow(tk.Toplevel):
         self.var_note = tk.StringVar(value="조문 인용 점검 중…" if self.api_factory else "")
         ttk.Label(top, textvariable=self.var_note, foreground="#8a3b00").pack(anchor="w")
 
-        rf = ttk.LabelFrame(self, text="정비 근거 — 조문 인용 점검(삭제·이동 여부, 대체 후보는 참고용)")
+        rf = ttk.LabelFrame(self, text="정비 근거 — 유형② 조문 인용 점검(대체 후보는 참고용) · 유형④ 용어 정비 후보")
         rf.pack(fill="x", padx=10, pady=4)
         self.tree = ttk.Treeview(rf, columns=("ref", "status", "cand"), show="headings", height=4)
-        for c, h, w in (("ref", "조례 속 인용", 280), ("status", "판정", 360), ("cand", "대체 후보(확인 필요)", 420)):
+        for c, h, w in (("ref", "조례 속 인용·용어", 280), ("status", "판정", 360), ("cand", "대체 후보·새 용어(확인 필요)", 420)):
             self.tree.heading(c, text=h); self.tree.column(c, width=w, anchor="w")
         self.tree.pack(side="left", fill="x", expand=True)
-        ttk.Button(rf, text="선택 후보 번호로\n개정안 바꾸기", command=self.apply_candidate).pack(side="left", padx=6)
+        ttk.Button(rf, text="선택한 후보로\n개정안 바꾸기", command=self.apply_candidate).pack(side="left", padx=6)
 
         pan = ttk.Panedwindow(self, orient="horizontal")
         pan.pack(fill="both", expand=True, padx=10, pady=4)
@@ -93,14 +96,32 @@ class DraftWindow(tk.Toplevel):
         try:
             api = self.api_factory()
             law_arts = api.get_law_articles(self.ev["law_mst"])
-            refs = R.check_refs(R.find_law_refs([("", cur)], [self.ev["law_name"], self.ev["cited"]]), law_arts, self.ev["law_name"])
+            aliases = [] if self.ev["is_old"] else [self.ev["cited"]]   # 옛 법령명이 아닌 인용명(약칭)은 현행으로
+            refs = R.check_refs(R.find_law_refs([("", cur)], [self.ev["law_name"], self.ev["cited"]]), law_arts, self.ev["law_name"], aliases)
             self.after(0, lambda: self._show_refs(refs))
         except Exception as ex:
             msg = str(ex).splitlines()[0]
             self.after(0, lambda: self.var_note.set("조문 인용 점검 못 함(법령 조회 실패): " + msg))
 
+    def _show_terms(self, cur):
+        """유형④: 용어정비_목록.txt 의 옛 용어가 이 조문 본문(「」 밖)에 있는지."""
+        try:
+            terms = R.load_terms(TERMS_FILE)
+        except OSError:
+            return
+        issues = R.find_term_issues([("", cur)], terms)
+        for t in issues:
+            self.items.append(("term", t))
+            st = "유형④ 용어 정비 후보" + (" — 권리·의무 관련 문장, 별도 검토" if t["rights"] else "")
+            self.tree.insert("", "end", values=(t["old"], st, f"{t['new']} ({t['note']})"))
+        if issues:
+            self.txt_memo.insert("end", "\n\n[유형④ 용어 정비 후보]\n" + "\n".join(
+                f"  - {t['old']} → {t['new']}({t['note']})" + (" — 권리·의무 관련 문장: 단순 용어 정리로 보지 말고 별도 검토" if t["rights"] else "")
+                for t in issues))
+
     def _show_refs(self, refs):
-        self.refs = refs
+        for r in refs:
+            self.items.append(("ref", r))
         for r in refs:
             c = r.get("candidate")
             self.tree.insert("", "end", values=(r["text"], r["status"] + (f" — 현행 {r['label']} {r['current_title']}" if r["current_title"] else ""),
@@ -115,7 +136,18 @@ class DraftWindow(tk.Toplevel):
         sel = self.tree.selection()
         if not sel:
             return
-        r = self.refs[self.tree.index(sel[0])]
+        kind, r = self.items[self.tree.index(sel[0])]
+        if kind == "term":
+            new_term = r["new"].split("(")[0].strip()   # ‘국가유산(또는 문화유산)’ → 첫 용어, 다른 용어는 직접 수정
+            txt = self.txt_new.get("1.0", "end-1c")
+            changed = R.replace_term_outside_brackets(txt, r["old"], new_term)
+            if changed == txt:
+                messagebox.showinfo("바꿀 곳 없음", "개정안에서 해당 용어를 찾지 못했습니다.", parent=self)
+                return
+            self.txt_new.delete("1.0", "end"); self.txt_new.insert("1.0", changed)
+            self.txt_memo.insert("end", f"\n  - [담당자 선택] 용어 {r['old']} → {new_term} 로 변경({r['note']})")
+            self.show_diff()
+            return
         c = r.get("candidate")
         if not c:
             messagebox.showinfo("대체 후보 없음", "대체 근거가 불명확합니다. 추가 확인 후 직접 수정하세요.", parent=self)
